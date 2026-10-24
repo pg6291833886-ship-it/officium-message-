@@ -27,7 +27,7 @@ The platform injects `DATABASE_URL` and sign-in settings on deploy. Do not commi
 
 1. Publish this project. Migrations in `migrations/` apply on deploy.
 2. Point `message.officiumconnect.in` at the published site and turn HTTPS on at the host.
-3. Set `CRON_SECRET` and schedule `/api/cron/tick` every five minutes.
+3. Set `CRON_SECRET` on the host. The committed schedule calls `/api/cron/tick` once a day at 03:00 UTC, which is the Hobby plan limit. Opening the app still runs due reminders between those runs.
 4. Sign in. The first account is the owner. Invite the team from Admin.
 
 ## Files

@@ -14,13 +14,9 @@ Do not put real secrets in the repository. Set the names below in the host’s e
 
 ## Scheduler
 
-`/api/cron/tick` runs reminders, webhook retries, and scheduled workflows. The host cron should call it every five minutes with:
+`/api/cron/tick` runs reminders, webhook retries, and scheduled workflows. On the Hobby plan the committed schedule is once a day at 03:00 UTC, because a five-minute schedule is rejected and the whole deployment fails. The request must send `Authorization: Bearer <CRON_SECRET>`.
 
-`Authorization: Bearer <CRON_SECRET>`
-
-If `CRON_SECRET` is missing, the route refuses to run (HTTP 503). While someone has the app open, the same work also runs so preview and a missed cron do not drop due reminders. That visit path is not a replacement for cron.
-
-Hobby hosting sometimes allows only a daily cron. If that is the case, due reminders can wait until that daily run or until someone opens the app. Use a host plan that allows a five-minute schedule if you need tighter delivery.
+If `CRON_SECRET` is missing, the route refuses to run (HTTP 503). While someone has the app open, the same work also runs so a missed cron does not drop due reminders. A Pro plan can change the schedule back to `*/5 * * * *`.
 
 ## Real time
 
