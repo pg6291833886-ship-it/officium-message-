@@ -316,6 +316,7 @@ async function loadMessages(sql: Sql, column: "channel_id" | "conversation_id", 
       attachmentData: r.deleted || remoteFileId(r.attachment_data) ? "" : (r.attachment_data ?? ""),
       read,
       reactions: reacts.filter((x) => x.message_id === r.id).map((x) => ({ userId: x.user_id, emoji: x.emoji })),
+      attachmentFileId: r.deleted ? "" : remoteFileId(r.attachment_data),
     };
   });
 }
@@ -345,6 +346,7 @@ async function handleCommand(sql: Sql, userId: string, role: string, target: { k
   const loc = target.kind === "channel" ? { channelId: target.id } : { conversationId: target.id };
   let result = "";
   const bot = "bot_recruitment";
+  let speaker = bot;
 
   if (cmd === "help" || cmd === "workflow-help") {
     result = "Commands: /help, /ask question, /assign me | name, /remind 30m text, /candidate-status name, /summarize, /create-task title, /escalate, /workflow-help. /ask uses the configured AI provider when it is enabled. Other commands are rules.";
@@ -478,15 +480,23 @@ async function handleCommand(sql: Sql, userId: string, role: string, target: { k
     result = "Escalated. Urgent label added and administrators were notified inside Officium Message. No external message was sent.";
     await audit(sql, userId, "escalate", target.id);
   } else {
-    result = `Unknown command /${cmd}. Type /help.`;
+    const wanted = cmd.replace(/[^a-z0-9]/g, "");
+    const customs = await sql<{ id: string; name: string; description: string; enabled: boolean }>`
+      select id, name, description, enabled from bots where workspace_id = ${WS} and system = false
+    `;
+    const hit = customs.find((b) => b.name.toLowerCase().replace(/[^a-z0-9]/g, "") === wanted);
+    if (!wanted || !hit) result = `Unknown command /${cmd}. Type /help. A custom bot replies to its name with spaces removed, for example /followup.`;
+    else if (!hit.enabled) result = `${hit.name} is turned off. A manager can enable it under Bots.`;
+    else result = hit.description.trim() || `${hit.name} received /${wanted}. Add a description on the bot to change this reply.`;
+    if (hit?.enabled) speaker = hit.id;
   }
 
   await sql`
     insert into bot_logs (id, workspace_id, bot_id, command, result, actor_id)
     values (${nid("log")}, ${WS}, ${bot}, ${`/${cmd}`}, ${result.slice(0, 500)}, ${userId})
   `;
-  const botId = cmd === "summarize" ? "bot_summary" : cmd === "remind" ? "bot_reminder" : bot;
-  await postBot(sql, loc, result, botId);
+  const speakerFor = cmd === "summarize" ? "bot_summary" : cmd === "remind" ? "bot_reminder" : speaker;
+  await postBot(sql, loc, result, speakerFor);
 }
 
 type Action = { type: string; value: string };
@@ -1163,7 +1173,13 @@ export const sendMessage = createServerFn({ method: "POST" })
           if (key) {
             try { await removeObject(key); } catch { /* the row was not saved, so a later sweep cannot see this object */ }
           }
-          return { ok: false as const, error: err instanceof Error ? err.message : "Could not store the file." };
+          const fallback = allowed.type.startsWith("image/") && bytes.length <= 1_500_000;
+          if (!fallback) return { ok: false as const, error: err instanceof Error ? err.message : "Could not store the file." };
+          storedAttachment = attachmentData;
+          await sql`
+            insert into stored_files (id, message_id, name, content_type, size_bytes, storage, inline_data, created_by, status)
+            values (${fileId}, ${"pending"}, ${attachmentName || "file"}, ${allowed.type}, ${bytes.length}, ${"database"}, ${attachmentData}, ${context.userId}, ${"ready"})
+          `;
         }
         storedAttachment = remotePointer(fileId);
       } else {
@@ -1260,7 +1276,7 @@ export const changeMessage = createServerFn({ method: "POST" })
     if (msg.conversation_id) await assertConvo(sql, context.userId, msg.conversation_id);
     if (data.action === "react") {
       const emoji = clean(data.emoji ?? "", 24);
-      if (!["Noted", "Yes", "Question", "Urgent"].includes(emoji)) return { ok: false as const, error: "Unknown reaction." };
+      if (!["Noted", "Yes", "Question", "Urgent", "👍", "✅", "❓", "👀"].includes(emoji)) return { ok: false as const, error: "Unknown reaction." };
       const existing = await sql<{ ok: number }>`
         select 1 as ok from reactions where message_id = ${data.id} and user_id = ${context.userId} and emoji = ${emoji}
       `;

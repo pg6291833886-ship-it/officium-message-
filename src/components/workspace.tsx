@@ -101,7 +101,7 @@ const PRIMARY = new Set<View>(["inbox", "dms", "activity"]);
 const STAR_KEY = "officium-message-stars";
 const THEME_KEY = "officium-message-theme";
 
-const REACTIONS = ["Noted", "Yes", "Question", "Urgent"] as const;
+const REACTIONS = ["👍", "✅", "❓", "👀"] as const;
 
 function timeLabel(iso: string) {
   if (!iso) return "";
@@ -168,6 +168,45 @@ function EmojiPicker({ onPick }: { onPick: (char: string) => void }) {
   );
 }
 
+const imagePreview = new Map<string, string>();
+
+function AttachmentView({
+  id, name, inline, onError,
+}: {
+  id: string;
+  name: string;
+  inline: string;
+  onError: (s: string) => void;
+}) {
+  const image = /\.(png|jpe?g|gif|webp)$/i.test(name) || inline.startsWith("data:image/");
+  const [src, setSrc] = useState(inline.startsWith("data:image/") ? inline : (imagePreview.get(id) ?? ""));
+  useEffect(() => {
+    if (!image || src) return;
+    let gone = false;
+    void fileData({ data: { id } }).then((r) => {
+      if (gone || !r.ok) return;
+      if (r.data.startsWith("data:image/") || r.data.startsWith("https://") || r.data.startsWith("http://")) {
+        imagePreview.set(id, r.data);
+        setSrc(r.data);
+      }
+    });
+    return () => { gone = true; };
+  }, [id, image, src]);
+  if (image && src) return <img src={src} alt={name || "Shared image"} className="mt-1 max-h-48 rounded-lg" />;
+  if (!name) return null;
+  return (
+    <button type="button" className="mt-1 text-xs text-accent underline" onClick={() => void fileData({ data: { id } }).then((r) => {
+      if (!r.ok) { onError(r.error); return; }
+      const a = document.createElement("a");
+      a.href = r.data;
+      a.download = name;
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      a.click();
+    })}>{name}</button>
+  );
+}
+
 function loadStars() {
   try {
     const raw = localStorage.getItem(STAR_KEY);
@@ -198,6 +237,7 @@ export function Workspace() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [older, setOlder] = useState<NonNullable<Awaited<ReturnType<typeof pulse>>["messages"]>>([]);
   const [olderDone, setOlderDone] = useState(false);
+  const [pendingMsgs, setPendingMsgs] = useState<{ id: string; focusKey: string; body: string; attachmentName: string; attachmentData: string }[]>([]);
   const endRef = useRef<HTMLDivElement>(null);
   const typingAt = useRef(0);
 
@@ -211,7 +251,7 @@ export function Workspace() {
     queryKey: ["pulse", focus?.kind ?? "", focus?.id ?? ""],
     queryFn: () => pulse({ data: focus ? { kind: focus.kind, id: focus.id } : {} }),
     enabled: Boolean(boot.data),
-    refetchInterval: 8000,
+    refetchInterval: 4000,
     refetchOnWindowFocus: false,
   });
 
@@ -275,6 +315,10 @@ export function Workspace() {
     ]);
   }
 
+  async function refreshThread() {
+    await qc.invalidateQueries({ queryKey: ["pulse"] });
+  }
+
   async function onSend() {
     if (!focus) return;
     setComposerError("");
@@ -287,63 +331,94 @@ export function Workspace() {
         }
         setEditingId("");
         setDraft("");
-        await refresh();
+        await refreshThread();
       } catch (e) {
         setComposerError(errText(e));
       }
       return;
     }
+    const text = draft;
+    const file = pendingFile;
+    const localId = `local-${Date.now()}`;
+    const focusKey = `${focus.kind}:${focus.id}`;
+    setDraft("");
+    setPendingFile(null);
+    setReplyTo("");
+    setPendingMsgs((cur) => [...cur, {
+      id: localId,
+      focusKey,
+      body: text || (file ? `Sending ${file.name}` : ""),
+      attachmentName: file?.name ?? "",
+      attachmentData: file?.data ?? "",
+    }]);
     try {
-      let attachmentData = pendingFile?.data;
+      let attachmentData = file?.data;
       let attachmentFileId: string | undefined;
-      if (pendingFile?.file) {
-        const prepared = await prepareUpload({
-          data: {
-            kind: focus.kind,
-            id: focus.id,
-            name: pendingFile.name,
-            contentType: pendingFile.file.type,
-            size: pendingFile.file.size,
-          },
-        });
-        if (!prepared.ok) {
-          setComposerError(prepared.error);
-          return;
-        }
-        let put: Response;
+      if (file?.file) {
+        let uploaded = false;
         try {
-          put = await fetch(prepared.uploadUrl, { method: "PUT", headers: prepared.headers, body: pendingFile.file });
+          const prepared = await prepareUpload({
+            data: {
+              kind: focus.kind,
+              id: focus.id,
+              name: file.name,
+              contentType: file.file.type,
+              size: file.file.size,
+            },
+          });
+          if (prepared.ok) {
+            try {
+              const put = await fetch(prepared.uploadUrl, { method: "PUT", headers: prepared.headers, body: file.file });
+              uploaded = put.ok;
+              if (uploaded) attachmentFileId = prepared.fileId;
+            } catch {
+              uploaded = false;
+            }
+          }
         } catch {
-          setComposerError("The browser was blocked before Cloudflare R2 could accept the file. Add a private CORS rule for https://message.officiumconnect.in that allows PUT, GET, and HEAD with the content-type header. The file was not saved.");
-          return;
+          uploaded = false;
         }
-        if (!put.ok) {
-          setComposerError(`Cloudflare R2 rejected the upload (HTTP ${put.status}). The file was not saved in the database.`);
-          return;
+        if (!uploaded) {
+          const blob = file.file;
+          if (blob && blob.type.startsWith("image/") && blob.size <= 1_500_000) {
+            attachmentData = await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result ?? ""));
+              reader.onerror = () => reject(new Error("Could not read the image."));
+              reader.readAsDataURL(blob);
+            });
+          } else {
+            setPendingMsgs((cur) => cur.filter((p) => p.id !== localId));
+            setDraft(text);
+            setPendingFile(file);
+            setComposerError("Cloudflare R2 rejected this file. Images under 1.5 MB are saved in the workspace instead, but this file is larger or is not an image. The saved R2 secret in Vercel is still the old one.");
+            return;
+          }
         }
-        attachmentFileId = prepared.fileId;
-        attachmentData = undefined;
       }
       const res = await sendMessage({
         data: {
           kind: focus.kind,
           id: focus.id,
-          body: draft,
+          body: text,
           replyToId: replyTo || undefined,
-          attachmentName: pendingFile?.name,
+          attachmentName: file?.name,
           attachmentData,
           attachmentFileId,
         },
       });
       if (!res.ok) {
+        setPendingMsgs((cur) => cur.filter((p) => p.id !== localId));
+        setDraft(text);
+        setPendingFile(file);
         setComposerError(res.error);
         return;
       }
-      setDraft("");
-      setReplyTo("");
-      setPendingFile(null);
-      await refresh();
+      await refreshThread();
     } catch (e) {
+      setPendingMsgs((cur) => cur.filter((p) => p.id !== localId));
+      setDraft(text);
+      setPendingFile(file);
       setComposerError(errText(e));
     }
   }
@@ -396,6 +471,28 @@ export function Workspace() {
   const shellClass = ["shell", messaging && drawer && detail ? "with-drawer" : ""].filter(Boolean).join(" ");
   const starredChannels = channels.filter((c) => stars.includes(c.id));
   const starredDms = conversations.filter((c) => stars.includes(c.id));
+  const focusKey = focus ? `${focus.kind}:${focus.id}` : "";
+  const shown = [
+    ...messages,
+    ...pendingMsgs.filter((p) => p.focusKey === focusKey && !messages.some((m) => m.mine && m.body === p.body && (m.attachmentName || "") === p.attachmentName)).map((p) => ({
+      id: p.id,
+      body: p.body,
+      authorId: data.me.id,
+      authorName: data.me.name,
+      mine: true,
+      createdAt: new Date().toISOString(),
+      editedAt: "",
+      deleted: false,
+      pinned: false,
+      replyToId: "",
+      attachmentName: p.attachmentName,
+      attachmentData: p.attachmentData,
+      attachmentFileId: "",
+      read: false,
+      reactions: [] as { userId: string; emoji: string }[],
+      pending: true as const,
+    })),
+  ];
 
   function toggleStar(id: string) {
     setStars((cur) => {
@@ -436,7 +533,7 @@ export function Workspace() {
 
   const messageBlocks: ReactNode[] = [];
   let lastDay = "";
-  for (const m of messages) {
+  for (const m of shown) {
     const day = dayLabel(m.createdAt);
     if (day && day !== lastDay) {
       lastDay = day;
@@ -452,32 +549,27 @@ export function Workspace() {
             <time dateTime={m.createdAt}>{timeLabel(m.createdAt)}</time>
             {m.editedAt ? <span>edited</span> : null}
             {m.mine ? <span>{m.read ? "read" : "sent"}</span> : null}
+            {m.mine && "pending" in m ? <span>sending</span> : null}
             {m.pinned ? <span>pinned</span> : null}
           </p>
           {m.replyToId ? <p className="text-xs text-muted">Reply</p> : null}
           <p className="msg-body">{m.body}</p>
-          {m.attachmentData?.startsWith("data:image/") ? (
-            <img src={m.attachmentData} alt={m.attachmentName || "Shared image"} className="mt-1 max-h-48 rounded-lg" />
-          ) : m.attachmentName ? (
-            <button type="button" className="mt-1 text-xs text-accent underline" onClick={() => void fileData({ data: { id: m.id } }).then((r) => {
-              if (!r.ok) { setComposerError(r.error); return; }
-              const a = document.createElement("a");
-              a.href = r.data;
-              a.download = r.name;
-              a.target = "_blank";
-              a.rel = "noreferrer";
-              a.click();
-            })}>{m.attachmentName}</button>
+          {m.attachmentName || m.attachmentData ? (
+            <AttachmentView id={m.id} name={m.attachmentName} inline={m.attachmentData} onError={setComposerError} />
           ) : null}
           {m.reactions.length ? (
-            <div>{m.reactions.map((r) => <span key={r.emoji} className="react-chip">{r.emoji}</span>)}</div>
+            <div>
+              {Array.from(m.reactions.reduce((map, r) => map.set(r.emoji, (map.get(r.emoji) ?? 0) + 1), new Map<string, number>())).map(([emoji, count]) => (
+                <button key={emoji} type="button" className="react-chip" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then((r) => { if (!r.ok) setComposerError(r.error); return refreshThread(); })}>{emoji} {count}</button>
+              ))}
+            </div>
           ) : null}
-          {!m.deleted ? (
+          {!m.deleted && !("pending" in m) ? (
             <div className="msg-actions">
               <button type="button" className="btn tiny ghost" onClick={() => setReplyTo(m.id)}>Reply</button>
-              <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "pin" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>Pin</button>
+              <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "pin" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refreshThread(); })}>Pin</button>
               {REACTIONS.map((emoji) => (
-                <button key={emoji} type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>{emoji}</button>
+                <button key={emoji} type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then((r) => { if (!r.ok) setComposerError(r.error); return refreshThread(); })}>{emoji}</button>
               ))}
               {m.mine ? (
                 <button type="button" className="btn tiny ghost" onClick={() => {
@@ -488,7 +580,7 @@ export function Workspace() {
                   requestAnimationFrame(() => draftRef.current?.focus());
                 }}>Edit</button>
               ) : null}
-              {m.mine ? <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "delete" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>Delete</button> : null}
+              {m.mine ? <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "delete" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refreshThread(); })}>Delete</button> : null}
             </div>
           ) : null}
         </div>
@@ -1083,31 +1175,42 @@ function Bots({
 }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [error, setError] = useState("");
+  const command = name.toLowerCase().replace(/[^a-z0-9]/g, "");
   return (
     <div className="space-y-3">
       <p className="max-w-2xl text-sm text-muted">
-        Slash commands stay rule-based except /ask, which calls the configured model only when someone types it. Drafts are not posted until a manager approves them. Bots only see threads the signed-in person can already open.
+        Built-in commands stay /help, /ask, /assign, /remind, /summarize, /create-task, and /escalate. A bot you create replies when someone types its name with spaces removed.
       </p>
-      {data.bots.map((b) => (
-        <article key={b.id} className="card">
-          <h2 className="font-medium">{b.name}</h2>
-          <p className="text-sm text-muted">{b.description}</p>
-          <p className="text-xs text-muted">{b.enabled ? "Enabled" : "Disabled"} · {b.system ? "Built in" : "Custom"}</p>
-          <button type="button" className="btn ghost tiny mt-2" onClick={() => void saveBot({ data: { id: b.id, name: b.name, description: b.description, enabled: !b.enabled } }).then(async (r) => { if (!r.ok) setNotice(r.error); await onChange(); })}>
-            {b.enabled ? "Disable" : "Enable"}
-          </button>
-        </article>
-      ))}
+      {data.bots.map((b) => {
+        const slash = b.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+        return (
+          <article key={b.id} className="card">
+            <h2 className="font-medium">{b.name}</h2>
+            <p className="text-sm text-muted">{b.description}</p>
+            <p className="text-xs text-muted">{b.enabled ? "Enabled" : "Disabled"} · {b.system ? "Built in" : `Custom · type /${slash}`}</p>
+            <button type="button" className="btn ghost tiny mt-2" onClick={() => void saveBot({ data: { id: b.id, name: b.name, description: b.description, enabled: !b.enabled } }).then(async (r) => { if (!r.ok) setError(r.error); else setError(""); await onChange(); }).catch((e) => setError(errText(e)))}>
+              {b.enabled ? "Disable" : "Enable"}
+            </button>
+          </article>
+        );
+      })}
       <form className="card space-y-2" onSubmit={(e) => {
         e.preventDefault();
+        setError("");
         void saveBot({ data: { name, description, enabled: true } }).then(async (r) => {
-          if (!r.ok) setNotice(r.error);
-          else { setName(""); setDescription(""); await onChange(); }
-        });
+          if (!r.ok) { setError(r.error); return; }
+          setNotice(`Bot created. In a channel or direct message, type /${command}.`);
+          setName("");
+          setDescription("");
+          await onChange();
+        }).catch((e) => setError(errText(e)));
       }}>
         <h2 className="font-medium">New bot</h2>
         <input className="field" placeholder="Name" value={name} onChange={(e) => setName(e.target.value)} required />
-        <textarea className="field" placeholder="What this bot is for" value={description} onChange={(e) => setDescription(e.target.value)} />
+        <textarea className="field" placeholder="What this bot should reply" value={description} onChange={(e) => setDescription(e.target.value)} />
+        {command.length >= 2 ? <p className="text-xs text-muted">Command: /{command}</p> : null}
+        {error ? <p className="text-sm text-danger">{error}</p> : null}
         <button className="btn" type="submit">Create bot</button>
       </form>
       <h3 className="font-medium">Command log</h3>

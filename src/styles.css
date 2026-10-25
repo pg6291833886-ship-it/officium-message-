@@ -315,7 +315,7 @@ html[data-theme="dark"] {
 .msg-meta time, .msg-meta span { color: var(--color-muted); font-size: 12px; }
 .msg-body { white-space: pre-wrap; font-size: 14px; }
 .msg.deleted .msg-body { color: var(--color-muted); font-style: italic; }
-.msg-actions { display: none; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.msg-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .msg:hover .msg-actions, .msg:focus-within .msg-actions { display: flex; }
 @media (hover: none) {
   .msg-actions { display: flex; }
@@ -329,6 +329,7 @@ html[data-theme="dark"] {
   border: 1px solid var(--color-line);
   background: var(--color-card);
   font-size: 12px;
+  cursor: pointer;
 }
 .composer {
   border-top: 1px solid var(--color-line);
