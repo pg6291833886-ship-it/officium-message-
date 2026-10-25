@@ -188,8 +188,13 @@ export const SESSION_TOKEN_COOKIE = "__Host-grok-auth.session_token";
 
 // Built separately so the `betterAuth({...})` call stays easy to edit without
 // breaking brackets (models often trip on the conditional plugin spread).
-const grokOAuthPlugin = authConfigured
-  ? genericOAuth({
+const dedicatedGrokClient = Boolean(env("GROK_AUTH_CLIENT_ID") && env("GROK_AUTH_CLIENT_SECRET"));
+// The shared preview client is only registered for `*.grok-sandbox.com`.
+// Using it on a custom domain makes the broker return "Invalid redirect URI".
+const previewBrokerAllowed = !explicitBaseURL;
+const grokOAuthPlugin =
+  authConfigured && (dedicatedGrokClient || previewBrokerAllowed)
+    ? genericOAuth({
       config: GROK_PROVIDERS.map(({ providerId, idp }) => ({
         providerId,
         clientId: grokClientId as string,

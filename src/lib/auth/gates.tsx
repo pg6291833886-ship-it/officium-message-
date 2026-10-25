@@ -1,7 +1,8 @@
-import { useState, useSyncExternalStore, type ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Navigate } from "@tanstack/react-router";
 import { GROK_PROVIDERS, authEnabled, signIn, signOut } from "./client";
 import { hasGateSessionMarker } from "./gate-session-marker";
+import { federatedSignInEnabled } from "./sign-in-options";
 import { resolveSignInGateState } from "./sign-in-gate";
 import { useCurrentUser, useCurrentUserState } from "./use-current-user";
 
@@ -64,6 +65,19 @@ export function SignInGate({
 }
 
 export function SignInButtons() {
+  const [federated, setFederated] = useState(false);
+  useEffect(() => {
+    void federatedSignInEnabled()
+      .then((enabled) => setFederated(enabled))
+      .catch(() => setFederated(false));
+  }, []);
+  if (!federated) {
+    return (
+      <a href="/login" className="w-full rounded-md border border-neutral-300 px-4 py-2 text-center hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-900">
+        Sign in
+      </a>
+    );
+  }
   return (
     <div className="flex w-full max-w-sm flex-col gap-2">
       {GROK_PROVIDERS.map((p) => (

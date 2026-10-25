@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { GROK_PROVIDERS, authClient, authEnabled, signIn } from "@/lib/auth/client";
+import { federatedSignInEnabled } from "@/lib/auth/sign-in-options";
 import { useCurrentUserState } from "@/lib/auth/use-current-user";
 
 export const Route = createFileRoute("/login")({ component: Login });
@@ -16,6 +17,13 @@ function Login() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [federated, setFederated] = useState(false);
+
+  useEffect(() => {
+    void federatedSignInEnabled()
+      .then((enabled) => setFederated(enabled))
+      .catch(() => setFederated(false));
+  }, []);
 
   if (!isPending && user) {
     void navigate({ to: "/" });
@@ -73,21 +81,23 @@ function Login() {
           {isPending ? <p className="text-sm text-muted">Checking your session…</p> : null}
           {authEnabled ? (
             <>
-              {GROK_PROVIDERS.map((p) => (
-                <button
-                  key={p.providerId}
-                  type="button"
-                  className="btn ghost w-full"
-                  onClick={() => {
-                    void signIn(p.providerId, { callbackURL: "/" }).catch((err: unknown) => {
-                      setError(err instanceof Error ? err.message : "Sign-in failed.");
-                    });
-                  }}
-                >
-                  Continue with {p.label}
-                </button>
-              ))}
-              <div className="h-px bg-line" />
+              {federated
+                ? GROK_PROVIDERS.map((p) => (
+                    <button
+                      key={p.providerId}
+                      type="button"
+                      className="btn ghost w-full"
+                      onClick={() => {
+                        void signIn(p.providerId, { callbackURL: "/" }).catch((err: unknown) => {
+                          setError(err instanceof Error ? err.message : "Sign-in failed.");
+                        });
+                      }}
+                    >
+                      Continue with {p.label}
+                    </button>
+                  ))
+                : null}
+              {federated ? <div className="h-px bg-line" /> : null}
               <form className="space-y-3" onSubmit={onEmail}>
                 {mode === "up" ? (
                   <input className="field" placeholder="Your name" value={name} onChange={(e) => setName(e.target.value)} />
