@@ -45,6 +45,8 @@ import {
   olderMessages,
   prepareUpload,
   pulse,
+  abandonUpload,
+  workspaceExtras,
   redeemInvite,
   relocateFiles,
   saveBot,
@@ -247,6 +249,13 @@ export function Workspace() {
     staleTime: 30_000,
     refetchOnWindowFocus: false,
   });
+  const extras = useQuery({
+    queryKey: ["extras"],
+    queryFn: () => workspaceExtras(),
+    enabled: Boolean(boot.data),
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
   const live = useQuery({
     queryKey: ["pulse", focus?.kind ?? "", focus?.id ?? ""],
     queryFn: () => pulse({ data: focus ? { kind: focus.kind, id: focus.id } : {} }),
@@ -264,9 +273,9 @@ export function Workspace() {
   const detail = live.data?.detail;
 
   useEffect(() => {
-    if (!focus) return;
+    if (!focus || !boot.data) return;
     void markRead({ data: focus }).catch(() => undefined);
-  }, [focus?.kind, focus?.id]);
+  }, [focus?.kind, focus?.id, boot.data?.me.id]);
 
   useEffect(() => {
     setOlder([]);
@@ -311,6 +320,7 @@ export function Workspace() {
   async function refresh() {
     await Promise.all([
       qc.invalidateQueries({ queryKey: ["boot"] }),
+      qc.invalidateQueries({ queryKey: ["extras"] }),
       qc.invalidateQueries({ queryKey: ["pulse"] }),
     ]);
   }
@@ -374,6 +384,7 @@ export function Workspace() {
             } catch {
               uploaded = false;
             }
+            if (!uploaded) void abandonUpload({ data: { fileId: prepared.fileId } }).catch(() => undefined);
           }
         } catch {
           uploaded = false;
@@ -465,7 +476,7 @@ export function Workspace() {
     );
   }
 
-  const data = boot.data;
+  const data = extras.data ? { ...boot.data, ...extras.data } : boot.data;
   const activityCount = live.data?.unreadNotifications ?? data.unreadNotifications;
   const pane = !messaging ? "tool" : focus ? "thread" : "list";
   const shellClass = ["shell", messaging && drawer && detail ? "with-drawer" : ""].filter(Boolean).join(" ");

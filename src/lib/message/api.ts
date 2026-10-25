@@ -696,98 +696,92 @@ async function threadSide(sql: Sql, kind: string, id: string) {
   };
 }
 
-async function latestPreview(sql: Sql, column: "channel_id" | "conversation_id", ids: string[]) {
-  const out = new Map<string, { preview: string; at: string }>();
-  if (!ids.length) return out;
-  const rows = await sql.query<{ id: string; body: string; created_at: unknown }>(
-    `select distinct on (${column}) ${column} as id, body, created_at
-     from messages
-     where deleted = false and ${column} in (${ids.map((_, i) => `$${i + 1}`).join(",")})
-     order by ${column}, created_at desc`,
-    ids,
-  );
-  for (const row of rows) out.set(row.id, { preview: (row.body ?? "").slice(0, 80), at: iso(row.created_at) });
-  return out;
-}
-
 async function sidebar(sql: Sql, userId: string, role: string) {
   const [channels, convos] = await Promise.all([
-    sql<{ id: string; name: string; topic: string; visibility: string; description: string }>`
-      select c.id, c.name, c.topic, c.visibility, c.description
-      from channels c
-      where c.workspace_id = ${WS} and c.archived = false
-        and (
-          exists (select 1 from channel_members cm where cm.channel_id = c.id and cm.user_id = ${userId})
-          or (c.visibility = 'public' and ${role} in ('owner', 'administrator', 'manager', 'member'))
-        )
-      order by c.name
-    `,
-    sql<{ id: string; kind: string; name: string; muted: boolean }>`
-      select c.id, c.kind, c.name, m.muted
-      from conversations c
-      join conversation_members m on m.conversation_id = c.id and m.user_id = ${userId}
-      where c.workspace_id = ${WS} and c.archived = false
-      order by c.created_at desc
-    `,
+    sql.query<{
+      id: string; name: string; topic: string; visibility: string; description: string;
+      preview: string | null; at: unknown; unread: number;
+    }>(
+      `select c.id, c.name, c.topic, c.visibility, c.description,
+              p.body as preview, p.created_at as at, coalesce(u.n, 0)::int as unread
+       from channels c
+       left join lateral (
+         select body, created_at from messages m
+         where m.channel_id = c.id and m.deleted = false
+         order by m.created_at desc
+         limit 1
+       ) p on true
+       left join lateral (
+         select count(*)::int as n
+         from messages m
+         left join channel_reads r on r.channel_id = m.channel_id and r.user_id = $2
+         where m.channel_id = c.id and m.deleted = false and m.author_id <> $2
+           and m.created_at > coalesce(r.last_read_at, '1970-01-01'::timestamptz)
+       ) u on true
+       where c.workspace_id = $1 and c.archived = false
+         and (
+           exists (select 1 from channel_members cm where cm.channel_id = c.id and cm.user_id = $2)
+           or (c.visibility = 'public' and $3::text in ('owner', 'administrator', 'manager', 'member'))
+         )
+       order by c.name`,
+      [WS, userId, role],
+    ),
+    sql.query<{
+      id: string; kind: string; name: string; muted: boolean;
+      preview: string | null; at: unknown; unread: number;
+      others: { display_name: string; presence: string }[] | null;
+    }>(
+      `select c.id, c.kind, c.name, m.muted,
+              p.body as preview, p.created_at as at, coalesce(u.n, 0)::int as unread,
+              people.others
+       from conversations c
+       join conversation_members m on m.conversation_id = c.id and m.user_id = $2
+       left join lateral (
+         select body, created_at from messages msg
+         where msg.conversation_id = c.id and msg.deleted = false
+         order by msg.created_at desc
+         limit 1
+       ) p on true
+       left join lateral (
+         select count(*)::int as n
+         from messages msg
+         where msg.conversation_id = c.id and msg.deleted = false and msg.author_id <> $2
+           and msg.created_at > coalesce(m.last_read_at, '1970-01-01'::timestamptz)
+       ) u on true
+       left join lateral (
+         select coalesce(json_agg(json_build_object('display_name', pr.display_name, 'presence', pr.presence) order by pr.display_name), '[]'::json) as others
+         from conversation_members cm
+         join profiles pr on pr.user_id = cm.user_id
+         where cm.conversation_id = c.id and cm.user_id <> $2
+       ) people on true
+       where c.workspace_id = $1 and c.archived = false
+       order by c.created_at desc`,
+      [WS, userId],
+    ),
   ]);
-  const channelIds = channels.map((c) => c.id);
-  const convoIds = convos.map((c) => c.id);
-  const [channelPreview, convoPreview, channelUnread, convoUnread, parts] = await Promise.all([
-    latestPreview(sql, "channel_id", channelIds),
-    latestPreview(sql, "conversation_id", convoIds),
-    channelIds.length
-      ? sql.query<{ channel_id: string; n: number }>(
-          `select m.channel_id, count(*)::int as n
-           from messages m
-           left join channel_reads r on r.channel_id = m.channel_id and r.user_id = $1
-           where m.deleted = false and m.author_id <> $1
-             and m.channel_id in (${channelIds.map((_, i) => `$${i + 2}`).join(",")})
-             and m.created_at > coalesce(r.last_read_at, '1970-01-01'::timestamptz)
-           group by m.channel_id`,
-          [userId, ...channelIds],
-        )
-      : Promise.resolve([] as { channel_id: string; n: number }[]),
-    convoIds.length
-      ? sql.query<{ conversation_id: string; n: number }>(
-          `select m.conversation_id, count(*)::int as n
-           from messages m
-           join conversation_members cm on cm.conversation_id = m.conversation_id and cm.user_id = $1
-           where m.deleted = false and m.author_id <> $1
-             and m.conversation_id in (${convoIds.map((_, i) => `$${i + 2}`).join(",")})
-             and m.created_at > coalesce(cm.last_read_at, '1970-01-01'::timestamptz)
-           group by m.conversation_id`,
-          [userId, ...convoIds],
-        )
-      : Promise.resolve([] as { conversation_id: string; n: number }[]),
-    convos.length
-      ? sql.query<{ conversation_id: string; user_id: string; display_name: string; presence: string }>(
-          `select cm.conversation_id, cm.user_id, p.display_name, p.presence
-           from conversation_members cm join profiles p on p.user_id = cm.user_id
-           where cm.conversation_id in (${convos.map((_, i) => `$${i + 1}`).join(",")})`,
-          convos.map((c) => c.id),
-        )
-      : Promise.resolve([] as { conversation_id: string; user_id: string; display_name: string; presence: string }[]),
-  ]);
-  const unreadC = new Map(channelUnread.map((r) => [r.channel_id, r.n]));
-  const unreadD = new Map(convoUnread.map((r) => [r.conversation_id, r.n]));
   return {
-    channels: channels.map((c) => {
-      const p = channelPreview.get(c.id);
-      return { ...c, preview: p?.preview ?? "", at: p?.at ?? "", unread: unreadC.get(c.id) ?? 0 };
-    }),
+    channels: channels.map((c) => ({
+      id: c.id,
+      name: c.name,
+      topic: c.topic,
+      visibility: c.visibility,
+      description: c.description,
+      preview: c.preview ?? "",
+      at: c.at ? iso(c.at) : "",
+      unread: Number(c.unread) || 0,
+    })),
     conversations: convos.map((c) => {
-      const people = parts.filter((p) => p.conversation_id === c.id && p.user_id !== userId);
-      const title = c.kind === "dm" ? (people.map((p) => p.display_name).join(", ") || "Direct message") : (c.name || "Group");
-      const p = convoPreview.get(c.id);
+      const others = Array.isArray(c.others) ? c.others : [];
+      const title = c.kind === "dm" ? (others.map((p) => p.display_name).filter(Boolean).join(", ") || "Direct message") : (c.name || "Group");
       return {
         id: c.id,
         kind: c.kind,
         name: title,
         muted: c.muted,
-        presence: c.kind === "dm" ? (people[0]?.presence ?? "offline") : "",
-        preview: p?.preview ?? "",
-        at: p?.at ?? "",
-        unread: unreadD.get(c.id) ?? 0,
+        presence: c.kind === "dm" ? (others[0]?.presence ?? "offline") : "",
+        preview: c.preview ?? "",
+        at: c.at ? iso(c.at) : "",
+        unread: Number(c.unread) || 0,
       };
     }),
   };
@@ -803,25 +797,45 @@ export const bootstrap = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    const staff = isStaff(me.role);
-    const [
-      ,
-      side,
-      members,
-      tasks,
-      reminders,
-      workflows,
-      runs,
-      bots,
-      logs,
-      integrations,
-      notesN,
-      notifications,
-      ai,
-      drafts,
-    ] = await Promise.all([
-      sql`update profiles set presence = 'active' where user_id = ${context.userId}`,
+    const [side, notesN] = await Promise.all([
       sidebar(sql, context.userId, me.role),
+      sql<{ n: number }>`select count(*)::int as n from notifications where user_id = ${context.userId} and read = false`,
+      sql`update profiles set presence = 'active' where user_id = ${context.userId}`,
+    ]);
+    return {
+      me: { id: context.userId, ...me },
+      workspace: { id: WS, name: "Officium Connect" },
+      labels: [...LABELS],
+      ...side,
+      members: [] as { user_id: string; display_name: string; email: string; role: string; presence: string }[],
+      tasks: [] as { id: string; title: string; status: string; createdAt: string }[],
+      reminders: [] as { id: string; body: string; dueAt: string; done: boolean }[],
+      workflows: [] as { id: string; name: string; description: string; enabled: boolean; configJson: string; lastRunAt: string }[],
+      runs: [] as { id: string; workflowId: string; status: string; detail: string; createdAt: string }[],
+      bots: [] as { id: string; name: string; description: string; enabled: boolean; system: boolean }[],
+      logs: [] as { id: string; command: string; result: string; createdAt: string }[],
+      integrations: [] as { provider: string; status: string; note: string }[],
+      unreadNotifications: notesN[0]?.n ?? 0,
+      notifications: [] as { id: string; body: string; read: boolean; createdAt: string }[],
+      ai: {
+        configured: false as boolean,
+        enabled: false as boolean,
+        requireApproval: true as boolean,
+        model: "" as string,
+        storage: "database" as "database" | "object",
+        maxBytes: 120_000 as number,
+      },
+      drafts: [] as { id: string; targetKind: string; targetId: string; body: string; createdAt: string }[],
+    };
+  });
+
+export const workspaceExtras = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    const me = await ensure(sql, context.userId);
+    const staff = isStaff(me.role);
+    const [members, tasks, reminders, workflows, runs, bots, logs, integrations, notifications, ai, drafts] = await Promise.all([
       sql<{ user_id: string; display_name: string; email: string; role: string; presence: string }>`
         select p.user_id, p.display_name, p.email, m.role, p.presence
         from memberships m join profiles p on p.user_id = m.user_id
@@ -861,7 +875,6 @@ export const bootstrap = createServerFn({ method: "POST" })
             select provider, status, note from integrations where workspace_id = ${WS} order by provider
           `
         : Promise.resolve([] as { provider: string; status: string; note: string }[]),
-      sql<{ n: number }>`select count(*)::int as n from notifications where user_id = ${context.userId} and read = false`,
       sql<{ id: string; body: string; read: boolean; created_at: unknown }>`
         select id, body, read, created_at from notifications where user_id = ${context.userId} order by created_at desc limit 25
       `,
@@ -875,10 +888,6 @@ export const bootstrap = createServerFn({ method: "POST" })
         : Promise.resolve([] as { id: string; target_kind: string; target_id: string; body: string; created_at: unknown }[]),
     ]);
     return {
-      me: { id: context.userId, ...me },
-      workspace: { id: WS, name: "Officium Connect" },
-      labels: [...LABELS],
-      ...side,
       members: members.map((m) => ({ ...m, email: me.role === "guest" ? "" : m.email })),
       tasks: tasks.map((t) => ({ id: t.id, title: t.title, status: t.status, createdAt: iso(t.created_at) })),
       reminders: reminders.map((r) => ({ id: r.id, body: r.body, dueAt: iso(r.due_at), done: r.done })),
@@ -890,9 +899,15 @@ export const bootstrap = createServerFn({ method: "POST" })
       bots,
       logs: logs.map((l) => ({ id: l.id, command: l.command, result: l.result, createdAt: iso(l.created_at) })),
       integrations,
-      unreadNotifications: notesN[0]?.n ?? 0,
       notifications: notifications.map((n) => ({ id: n.id, body: n.body, read: n.read, createdAt: iso(n.created_at) })),
-      ai: { configured: ai.configured, enabled: ai.enabled, requireApproval: ai.requireApproval, model: ai.model, storage: ai.storage, maxBytes: ai.maxBytes },
+      ai: {
+        configured: ai.configured,
+        enabled: ai.enabled,
+        requireApproval: ai.requireApproval,
+        model: ai.model,
+        storage: ai.storage === "object" ? "object" as const : "database" as const,
+        maxBytes: ai.maxBytes,
+      },
       drafts: drafts.map((d) => ({ id: d.id, targetKind: d.target_kind, targetId: d.target_id, body: d.body, createdAt: iso(d.created_at) })),
     };
   });
@@ -1254,6 +1269,25 @@ export const prepareUpload = createServerFn({ method: "POST" })
       headers: { "content-type": allowed.type },
       expiresIn: 300,
     };
+  });
+
+export const abandonUpload = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: unknown) => z.object({ fileId: z.string().min(1).max(40) }).parse(input))
+  .handler(async ({ context, data }) => {
+    if (!/^file_[a-f0-9]{18}$/.test(data.fileId)) return { ok: false as const, error: "Unknown file." };
+    const sql = await getSql();
+    await ensure(sql, context.userId);
+    const rows = await sql<{ object_key: string | null }>`
+      delete from stored_files
+      where id = ${data.fileId} and created_by = ${context.userId} and status = 'pending'
+      returning object_key
+    `;
+    const key = rows[0]?.object_key;
+    if (key && storageConfigured()) {
+      try { await removeObject(key); } catch { /* the database row is already gone */ }
+    }
+    return { ok: true as const };
   });
 
 export const changeMessage = createServerFn({ method: "POST" })
