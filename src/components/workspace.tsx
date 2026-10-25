@@ -19,12 +19,14 @@ import {
   Send,
   Settings,
   Shield,
+  Smile,
   Star,
   Users,
   Workflow,
 } from "lucide-react";
 import { UserButton } from "@/lib/auth/gates";
 import { isAdmin, isStaff, navAllowed } from "@/lib/message/access";
+import { searchEmojis } from "@/lib/message/emoji";
 import {
   analytics,
   bootstrap,
@@ -123,6 +125,49 @@ function dayLabel(iso: string) {
   return d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
 }
 
+function EmojiPicker({ onPick }: { onPick: (char: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const hits = useMemo(() => searchEmojis(query), [query]);
+  return (
+    <div className="emoji-pop">
+      <button
+        type="button"
+        className="btn ghost icon-btn"
+        aria-label="Insert emoji"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Smile size={18} />
+      </button>
+      {open ? (
+        <div className="emoji-panel" role="dialog" aria-label="Emoji picker">
+          <input
+            className="field"
+            placeholder="Search emoji"
+            aria-label="Search emoji"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <div className="emoji-grid">
+            {hits.length === 0 ? <p className="text-xs text-muted">No emoji matches that search.</p> : hits.map((emoji) => (
+              <button
+                key={emoji.char + emoji.name}
+                type="button"
+                className="emoji-btn"
+                aria-label={emoji.name}
+                onClick={() => onPick(emoji.char)}
+              >
+                {emoji.char}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function loadStars() {
   try {
     const raw = localStorage.getItem(STAR_KEY);
@@ -139,12 +184,14 @@ export function Workspace() {
   const [focus, setFocus] = useState<Focus | null>({ kind: "channel", id: "ch_general" });
   const [drawer, setDrawer] = useState(false);
   const [draft, setDraft] = useState("");
+  const [editingId, setEditingId] = useState("");
   const [replyTo, setReplyTo] = useState("");
   const [notice, setNotice] = useState("");
   const [q, setQ] = useState("");
   const [searchHits, setSearchHits] = useState<Awaited<ReturnType<typeof searchAll>> | null>(null);
   const [composerError, setComposerError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const draftRef = useRef<HTMLTextAreaElement>(null);
   const [pendingFile, setPendingFile] = useState<{ name: string; data?: string; file?: File } | null>(null);
   const [stars, setStars] = useState<string[]>([]);
   const [sections, setSections] = useState({ starred: true, channels: true, dms: true, more: false });
@@ -184,6 +231,7 @@ export function Workspace() {
   useEffect(() => {
     setOlder([]);
     setOlderDone(false);
+    setEditingId("");
   }, [focus?.kind, focus?.id]);
 
   useEffect(() => {
@@ -230,6 +278,21 @@ export function Workspace() {
   async function onSend() {
     if (!focus) return;
     setComposerError("");
+    if (editingId) {
+      try {
+        const res = await changeMessage({ data: { id: editingId, action: "edit", body: draft } });
+        if (!res.ok) {
+          setComposerError(res.error);
+          return;
+        }
+        setEditingId("");
+        setDraft("");
+        await refresh();
+      } catch (e) {
+        setComposerError(errText(e));
+      }
+      return;
+    }
     try {
       let attachmentData = pendingFile?.data;
       let attachmentFileId: string | undefined;
@@ -285,7 +348,20 @@ export function Workspace() {
     }
   }
 
-  async function runSearch(value: string) {
+  function insertEmoji(char: string) {
+    const el = draftRef.current;
+    const start = el?.selectionStart ?? draft.length;
+    const end = el?.selectionEnd ?? draft.length;
+    const next = `${draft.slice(0, start)}${char}${draft.slice(end)}`;
+    setDraft(next);
+    const caret = start + char.length;
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(caret, caret);
+    });
+  }
+
+  function runSearch(value: string) {
     setQ(value);
   }
 
@@ -403,6 +479,15 @@ export function Workspace() {
               {REACTIONS.map((emoji) => (
                 <button key={emoji} type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>{emoji}</button>
               ))}
+              {m.mine ? (
+                <button type="button" className="btn tiny ghost" onClick={() => {
+                  setEditingId(m.id);
+                  setDraft(m.body);
+                  setReplyTo("");
+                  setComposerError("");
+                  requestAnimationFrame(() => draftRef.current?.focus());
+                }}>Edit</button>
+              ) : null}
               {m.mine ? <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "delete" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>Delete</button> : null}
             </div>
           ) : null}
@@ -564,6 +649,7 @@ export function Workspace() {
             <div ref={endRef} />
           </div>
           <form className="composer" onSubmit={(e) => { e.preventDefault(); void onSend(); }}>
+            {editingId ? <p className="mb-1 text-xs text-muted">Editing your message <button type="button" className="text-accent" onClick={() => { setEditingId(""); setDraft(""); }}>cancel</button></p> : null}
             {replyTo ? <p className="mb-1 text-xs text-muted">Replying <button type="button" className="text-accent" onClick={() => setReplyTo("")}>cancel</button></p> : null}
             {pendingFile ? <p className="mb-1 text-xs">Attached: {pendingFile.name}</p> : null}
             {composerError ? <p className="mb-1 text-sm text-danger">{composerError}</p> : null}
@@ -602,14 +688,16 @@ export function Workspace() {
               <button type="button" className="btn ghost icon-btn" aria-label="Attach file" onClick={() => fileRef.current?.click()}>
                 <Plus size={18} />
               </button>
+              <EmojiPicker onPick={insertEmoji} />
               <textarea
+                ref={draftRef}
                 className="field"
-                placeholder={`Message ${focus.kind === "channel" ? `#${title}` : title}`}
+                placeholder={editingId ? "Edit your message" : `Message ${focus.kind === "channel" ? `#${title}` : title}`}
                 value={draft}
                 rows={1}
                 onChange={(e) => {
                   setDraft(e.target.value);
-                  if (!focus) return;
+                  if (!focus || editingId) return;
                   const now = Date.now();
                   if (now - typingAt.current < 2000) return;
                   typingAt.current = now;
@@ -622,7 +710,7 @@ export function Workspace() {
                   }
                 }}
               />
-              <button className="btn icon-btn" type="submit" aria-label="Send"><Send size={18} /></button>
+              <button className="btn icon-btn" type="submit" aria-label={editingId ? "Save edit" : "Send"}><Send size={18} /></button>
             </div>
           </form>
         </section>

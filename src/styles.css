@@ -317,6 +317,9 @@ html[data-theme="dark"] {
 .msg.deleted .msg-body { color: var(--color-muted); font-style: italic; }
 .msg-actions { display: none; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .msg:hover .msg-actions, .msg:focus-within .msg-actions { display: flex; }
+@media (hover: none) {
+  .msg-actions { display: flex; }
+}
 .pin-line { margin: 0 16px; padding-top: 8px; font-size: 12px; color: var(--color-accent); }
 .react-chip {
   display: inline-flex;
@@ -361,6 +364,36 @@ html[data-theme="dark"] {
   padding: 8px 4px;
   resize: none;
 }
+.emoji-pop { position: relative; flex: none; }
+.emoji-panel {
+  position: absolute;
+  bottom: 42px;
+  left: 0;
+  z-index: 30;
+  width: min(280px, 78vw);
+  padding: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 10px;
+  background: var(--color-card);
+  box-shadow: 0 10px 28px rgba(16, 28, 48, 0.18);
+}
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 2px;
+  max-height: 180px;
+  overflow: auto;
+  margin-top: 8px;
+}
+.emoji-btn {
+  height: 32px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 18px;
+  line-height: 1;
+}
+.emoji-btn:hover, .emoji-btn:focus-visible { background: var(--color-accent-soft); }
 .btn {
   background: var(--color-accent);
   color: #fff;
