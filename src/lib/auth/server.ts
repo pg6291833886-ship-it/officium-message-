@@ -254,7 +254,23 @@ export const auth = betterAuth({
   session: { cookieCache: { enabled: true, maxAge: 300 } },
 
   // Local email/password — toggled only via `./email-password` (not a plugin).
-  ...(emailAndPasswordEnabled ? { emailAndPassword: { enabled: true } } : {}),
+  ...(emailAndPasswordEnabled
+    ? {
+        emailAndPassword: {
+          enabled: true,
+          revokeSessionsOnPasswordReset: true,
+          sendResetPassword: async ({ user, url }: { user: { email: string }; url: string }) => {
+            const { sendEmailMessage } = await import("../message/platform");
+            const sent = await sendEmailMessage(
+              user.email,
+              "Reset your Officium Message password",
+              `Choose a new password for Officium Message. This link expires in one hour.\n\n${url}\n\nIf you did not ask for this, ignore the email.`,
+            );
+            if (!sent.ok) throw new Error(sent.error);
+          },
+        },
+      }
+    : {}),
 
   // `__Host-` prefixed cookies: the browser REFUSES any same-named cookie that
   // carries a `Domain` attribute, so a sibling `*.grok.me` app cannot "toss" a
