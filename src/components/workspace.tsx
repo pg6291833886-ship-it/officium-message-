@@ -32,6 +32,7 @@ import {
   bootstrap,
   changeMessage,
   createChannel,
+  archiveChannel,
   createGroup,
   createInvite,
   deleteWorkflow,
@@ -458,6 +459,10 @@ export function Workspace() {
     setSearchHits(null);
   }
 
+  useEffect(() => {
+    if (boot.data && isStaff(boot.data.me.role)) setSections((current) => (current.more ? current : { ...current, more: true }));
+  }, [boot.data?.me.role]);
+
   if (boot.isPending) {
     return (
       <main className="grid min-h-dvh place-items-center bg-paper">
@@ -610,11 +615,22 @@ export function Workspace() {
           <img src="/officium-mark.png" alt="" />
         )}
         <div className="grow min-w-0">
-          {pane === "thread" ? <h1 className="truncate">{focus?.kind === "channel" ? `#${title}` : title}</h1> : null}
+          {pane === "thread" ? <h1 className="truncate">{focus?.kind === "channel" ? `#${title}` : title}</h1> : <h1 className="truncate">{data.me.name} · {data.me.role}</h1>}
         </div>
         <button type="button" className="icon-btn" style={{ background: "transparent", color: "inherit" }} aria-label="Search" onClick={() => { setFocus(null); setView("inbox"); }}>
           <Search size={18} />
         </button>
+        {pane === "thread" && focus?.kind === "channel" && isStaff(data.me.role) ? (
+          <button type="button" className="btn tiny ghost" style={{ color: "inherit", borderColor: "#2a4266" }} onClick={() => {
+            if (!window.confirm("Remove this channel from the list? Existing messages stay saved.")) return;
+            void archiveChannel({ data: { id: focus.id } }).then(async (r) => {
+              if (!r.ok) { setNotice(r.error); return; }
+              setFocus(null);
+              setNotice("Channel removed from the list.");
+              await refresh();
+            });
+          }}>Remove</button>
+        ) : null}
         {pane === "thread" ? <button type="button" className="btn tiny ghost" style={{ color: "inherit", borderColor: "#2a4266" }} onClick={() => setDrawer((v) => !v)}>Details</button> : <UserButton />}
       </header>
 
@@ -684,8 +700,8 @@ export function Workspace() {
               </button>
               {sections.channels ? (
                 <>
+                  {isStaff(data.me.role) ? <div className="px-3 py-2"><ChannelForm onDone={async (id) => { await refresh(); openFocus({ kind: "channel", id }); }} /></div> : <p className="px-4 pb-2 text-xs text-[var(--color-side-muted)]">New channels, bots, and removing a channel are on the owner account.</p>}
                   {channels.map((c) => row({ ...c, kind: "channel" }))}
-                  {isStaff(data.me.role) ? <div className="px-3 py-2"><ChannelForm onDone={async (id) => { await refresh(); openFocus({ kind: "channel", id }); }} /></div> : null}
                 </>
               ) : null}
               <button type="button" className="section-toggle" aria-expanded={sections.dms} onClick={() => setSections((s) => ({ ...s, dms: !s.dms }))}>
@@ -702,7 +718,13 @@ export function Workspace() {
           <button type="button" className="section-toggle" aria-expanded={sections.more} onClick={() => setSections((s) => ({ ...s, more: !s.more }))}>
             {sections.more ? <ChevronDown size={14} /> : <ChevronRight size={14} />} More
           </button>
-          {sections.more ? NAV.filter((item) => !PRIMARY.has(item.id) && item.id !== "channels" && navAllowed(item.id, data.me.role)).map((item) => {
+          {isStaff(data.me.role) ? (
+            <button type="button" className="more-link" data-on={view === "bots"} onClick={() => go("bots")}>
+              <Bot size={18} strokeWidth={1.75} />
+              <span>Bots</span>
+            </button>
+          ) : null}
+          {sections.more ? NAV.filter((item) => !PRIMARY.has(item.id) && item.id !== "channels" && item.id !== "bots" && navAllowed(item.id, data.me.role)).map((item) => {
             const Icon = item.icon;
             return (
               <button key={item.id} type="button" className="more-link" data-on={view === item.id} onClick={() => go(item.id)}>
@@ -894,6 +916,17 @@ export function Workspace() {
             {detail.notes.map((n) => (
               <p key={n.id} className="rounded-lg bg-paper p-2">{n.body}<span className="block text-xs text-muted">{n.authorName}</span></p>
             ))}
+            {focus.kind === "channel" && isStaff(data.me.role) ? (
+              <button type="button" className="btn ghost tiny" onClick={() => {
+                if (!focus || !window.confirm("Remove this channel from the list? Existing messages stay saved.")) return;
+                void archiveChannel({ data: { id: focus.id } }).then(async (r) => {
+                  if (!r.ok) { setNotice(r.error); return; }
+                  setFocus(null);
+                  setDrawer(false);
+                  await refresh();
+                });
+              }}>Remove channel</button>
+            ) : null}
             {focus.kind === "conversation" ? (
               <div className="flex flex-wrap gap-2">
                 <button type="button" className="btn ghost tiny" onClick={() => void setConversationFlags({ data: { id: focus.id, muted: true } }).then(async (r) => {

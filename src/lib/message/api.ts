@@ -1423,6 +1423,23 @@ export const createChannel = createServerFn({ method: "POST" })
     return { ok: true as const, id };
   });
 
+export const archiveChannel = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: unknown) => z.object({ id: z.string().min(1).max(80) }).parse(input))
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    const me = await ensure(sql, context.userId);
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can remove channels." };
+    const rows = await sql<{ id: string }>`
+      update channels set archived = true
+      where id = ${data.id} and workspace_id = ${WS} and archived = false
+      returning id
+    `;
+    if (!rows[0]) return { ok: false as const, error: "Channel not found." };
+    await audit(sql, context.userId, "archive_channel", data.id);
+    return { ok: true as const };
+  });
+
 export const openDm = createServerFn({ method: "POST" })
   .middleware([authMiddleware])
   .validator((input: unknown) => z.object({ userId: z.string().min(1).max(80) }).parse(input))
