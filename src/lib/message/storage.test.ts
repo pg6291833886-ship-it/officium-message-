@@ -14,6 +14,7 @@ import {
   storageDiagnosis,
   storageSetupMessage,
   credentialFingerprint,
+  r2TokenProblem,
 } from "./storage.ts";
 
 const KEYS = [
@@ -61,6 +62,24 @@ test("credential fingerprint describes shape and never echoes the secret", () =>
   assert.match(note, /expected private bucket/);
   assert.equal(note.includes("not-a-real-secret-value"), false);
   assert.equal(note.includes("abcdef0123456789abcdef0123456789"), false);
+  restoreEnv(previous);
+});
+
+test("a 32-character secret is rejected and is not printed", () => {
+  const previous = saveEnv();
+  clearEnv();
+  const access = "a".repeat(32);
+  process.env.R2_ACCOUNT_ID = "b".repeat(32);
+  process.env.R2_ACCESS_KEY_ID = access;
+  process.env.R2_SECRET_ACCESS_KEY = access;
+  process.env.R2_BUCKET = "officium-message-files";
+  const problem = r2TokenProblem();
+  assert.match(problem, /same value as the access key/);
+  assert.equal(problem.includes(access), false);
+  process.env.R2_SECRET_ACCESS_KEY = "c".repeat(32);
+  assert.match(r2TokenProblem(), /64 hexadecimal/);
+  process.env.R2_SECRET_ACCESS_KEY = "d".repeat(64);
+  assert.equal(r2TokenProblem(), "");
   restoreEnv(previous);
 });
 

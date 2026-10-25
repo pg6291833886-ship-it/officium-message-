@@ -217,6 +217,27 @@ export function credentialFingerprint() {
   return `Account id is ${classify(envName("R2_ACCOUNT_ID"))}. Access key is ${classify(envName("R2_ACCESS_KEY_ID") || envName("S3_ACCESS_KEY_ID"))}. Secret is ${classify(envName("R2_SECRET_ACCESS_KEY") || envName("S3_SECRET_ACCESS_KEY"))}. Bucket is ${bucketNote}.`;
 }
 
+/**
+ * Why the saved R2 token cannot work. Empty when the shape is acceptable.
+ * Never includes the credential text.
+ */
+export function r2TokenProblem() {
+  const account = envName("R2_ACCOUNT_ID");
+  const access = envName("R2_ACCESS_KEY_ID") || envName("S3_ACCESS_KEY_ID");
+  const secret = envName("R2_SECRET_ACCESS_KEY") || envName("S3_SECRET_ACCESS_KEY");
+  const bucket = envName("R2_BUCKET") || envName("S3_BUCKET");
+  const issues: string[] = [];
+  if (!/^[a-f0-9]{32}$/i.test(account)) issues.push("R2_ACCOUNT_ID must be 32 hexadecimal characters from the same Cloudflare account as the token.");
+  if (!/^[a-f0-9]{32}$/i.test(access)) issues.push("R2_ACCESS_KEY_ID must be the 32-character S3 Access Key ID. Do not paste a Cloudflare API bearer token.");
+  if (access && secret && access === secret) {
+    issues.push("R2_SECRET_ACCESS_KEY is the same value as the access key. Paste the Secret Access Key instead. It is shown once and is 64 hexadecimal characters.");
+  } else if (!/^[a-f0-9]{64}$/i.test(secret)) {
+    issues.push("R2_SECRET_ACCESS_KEY must be 64 hexadecimal characters. A 32-character value is an access key, not the secret. Create a new Object Read & Write token and replace both values.");
+  }
+  if (bucket !== "officium-message-files") issues.push("R2_BUCKET must be officium-message-files, with public access left off.");
+  return issues.join(" ");
+}
+
 export function safeFileName(name: string) {
   const cleaned = name.replace(/[\r\n"\\]/g, "").replace(/[^\w.\- ()[\]]+/g, "_").slice(0, 120);
   return cleaned || "file";
