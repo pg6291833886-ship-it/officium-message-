@@ -24,6 +24,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { UserButton } from "@/lib/auth/gates";
+import { isAdmin, isStaff, navAllowed } from "@/lib/message/access";
 import {
   analytics,
   bootstrap,
@@ -39,6 +40,7 @@ import {
   markNotificationsRead,
   markRead,
   openDm,
+  olderMessages,
   prepareUpload,
   pulse,
   redeemInvite,
@@ -147,28 +149,53 @@ export function Workspace() {
   const [stars, setStars] = useState<string[]>([]);
   const [sections, setSections] = useState({ starred: true, channels: true, dms: true, more: false });
   const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [older, setOlder] = useState<NonNullable<Awaited<ReturnType<typeof pulse>>["messages"]>>([]);
+  const [olderDone, setOlderDone] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
+  const typingAt = useRef(0);
 
-  const boot = useQuery({ queryKey: ["boot"], queryFn: () => bootstrap() });
+  const boot = useQuery({
+    queryKey: ["boot"],
+    queryFn: () => bootstrap(),
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
   const live = useQuery({
     queryKey: ["pulse", focus?.kind ?? "", focus?.id ?? ""],
     queryFn: () => pulse({ data: focus ? { kind: focus.kind, id: focus.id } : {} }),
     enabled: Boolean(boot.data),
-    refetchInterval: 3000,
+    refetchInterval: 8000,
+    refetchOnWindowFocus: false,
   });
 
   const messaging = view === "inbox" || view === "dms" || view === "channels";
   const channels = live.data?.channels ?? boot.data?.channels ?? [];
   const conversations = live.data?.conversations ?? boot.data?.conversations ?? [];
-  const messages = live.data?.messages ?? [];
+  const liveMessages = live.data?.messages ?? [];
+  const liveIds = new Set(liveMessages.map((m) => m.id));
+  const messages = [...older.filter((m) => !liveIds.has(m.id)), ...liveMessages];
   const detail = live.data?.detail;
 
   useEffect(() => {
     if (!focus) return;
-    void markRead({ data: focus }).then(() => {
-      void qc.invalidateQueries({ queryKey: ["pulse"] });
-    });
-  }, [focus?.kind, focus?.id, qc]);
+    void markRead({ data: focus }).catch(() => undefined);
+  }, [focus?.kind, focus?.id]);
+
+  useEffect(() => {
+    setOlder([]);
+    setOlderDone(false);
+  }, [focus?.kind, focus?.id]);
+
+  useEffect(() => {
+    if (q.trim().length < 2) {
+      setSearchHits(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      void searchAll({ data: { q: q.trim() } }).then(setSearchHits).catch((e) => setNotice(errText(e)));
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [q]);
 
   useEffect(() => {
     setStars(loadStars());
@@ -260,15 +287,6 @@ export function Workspace() {
 
   async function runSearch(value: string) {
     setQ(value);
-    if (value.trim().length < 2) {
-      setSearchHits(null);
-      return;
-    }
-    try {
-      setSearchHits(await searchAll({ data: { q: value.trim() } }));
-    } catch (e) {
-      setNotice(errText(e));
-    }
   }
 
   function openFocus(next: Focus) {
@@ -312,8 +330,12 @@ export function Workspace() {
   }
 
   function go(next: View) {
+    if (!navAllowed(next, data.me.role)) return;
     setView(next);
     setSearchHits(null);
+    if (next === "activity" || next === "members" || next === "settings" || next === "admin") {
+      void qc.invalidateQueries({ queryKey: ["boot"] });
+    }
     if (next !== "inbox" && next !== "dms" && next !== "channels") setFocus(null);
     else if (window.matchMedia("(max-width: 767px)").matches) setFocus(null);
   }
@@ -377,11 +399,11 @@ export function Workspace() {
           {!m.deleted ? (
             <div className="msg-actions">
               <button type="button" className="btn tiny ghost" onClick={() => setReplyTo(m.id)}>Reply</button>
-              <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "pin" } }).then(refresh)}>Pin</button>
+              <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "pin" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>Pin</button>
               {REACTIONS.map((emoji) => (
-                <button key={emoji} type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then(refresh)}>{emoji}</button>
+                <button key={emoji} type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "react", emoji } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>{emoji}</button>
               ))}
-              {m.mine ? <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "delete" } }).then(refresh)}>Delete</button> : null}
+              {m.mine ? <button type="button" className="btn tiny ghost" onClick={() => void changeMessage({ data: { id: m.id, action: "delete" } }).then((r) => { if (!r.ok) setComposerError(r.error); return refresh(); })}>Delete</button> : null}
             </div>
           ) : null}
         </div>
@@ -475,7 +497,7 @@ export function Workspace() {
               {sections.channels ? (
                 <>
                   {channels.map((c) => row({ ...c, kind: "channel" }))}
-                  <div className="px-3 py-2"><ChannelForm onDone={async (id) => { await refresh(); openFocus({ kind: "channel", id }); }} /></div>
+                  {isStaff(data.me.role) ? <div className="px-3 py-2"><ChannelForm onDone={async (id) => { await refresh(); openFocus({ kind: "channel", id }); }} /></div> : null}
                 </>
               ) : null}
               <button type="button" className="section-toggle" aria-expanded={sections.dms} onClick={() => setSections((s) => ({ ...s, dms: !s.dms }))}>
@@ -484,7 +506,7 @@ export function Workspace() {
               {sections.dms ? (
                 <>
                   {conversations.map((c) => row({ ...c, kind: "conversation" }))}
-                  <div className="px-3 py-2"><GroupForm members={data.members} me={data.me.id} onDone={async (id) => { await refresh(); openFocus({ kind: "conversation", id }); }} /></div>
+                  {data.me.role !== "guest" ? <div className="px-3 py-2"><GroupForm members={data.members} me={data.me.id} onDone={async (id) => { await refresh(); openFocus({ kind: "conversation", id }); }} /></div> : null}
                 </>
               ) : null}
             </>
@@ -492,7 +514,7 @@ export function Workspace() {
           <button type="button" className="section-toggle" aria-expanded={sections.more} onClick={() => setSections((s) => ({ ...s, more: !s.more }))}>
             {sections.more ? <ChevronDown size={14} /> : <ChevronRight size={14} />} More
           </button>
-          {sections.more ? NAV.filter((item) => !PRIMARY.has(item.id) && item.id !== "channels").map((item) => {
+          {sections.more ? NAV.filter((item) => !PRIMARY.has(item.id) && item.id !== "channels" && navAllowed(item.id, data.me.role)).map((item) => {
             const Icon = item.icon;
             return (
               <button key={item.id} type="button" className="more-link" data-on={view === item.id} onClick={() => go(item.id)}>
@@ -525,6 +547,16 @@ export function Workspace() {
             <button type="button" className="btn ghost tiny" onClick={() => setDrawer((v) => !v)}>Details</button>
           </header>
           <div className="scroll">
+            {focus && !olderDone && live.data?.olderAvailable ? (
+              <button type="button" className="btn ghost tiny mb-2" onClick={() => {
+                const oldest = messages[0]?.createdAt;
+                if (!oldest) return;
+                void olderMessages({ data: { kind: focus.kind, id: focus.id, before: oldest } }).then((r) => {
+                  if (!r.messages.length) setOlderDone(true);
+                  else setOlder((cur) => [...r.messages, ...cur]);
+                }).catch((e) => setComposerError(errText(e)));
+              }}>Load older messages</button>
+            ) : null}
             {messages.filter((m) => m.pinned && !m.deleted).map((m) => (
               <p key={`pin-${m.id}`} className="pin-line">Pinned: {m.body.slice(0, 140)}</p>
             ))}
@@ -577,7 +609,11 @@ export function Workspace() {
                 rows={1}
                 onChange={(e) => {
                   setDraft(e.target.value);
-                  if (focus) void setTyping({ data: focus }).catch(() => undefined);
+                  if (!focus) return;
+                  const now = Date.now();
+                  if (now - typingAt.current < 2000) return;
+                  typingAt.current = now;
+                  void setTyping({ data: focus }).catch(() => undefined);
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
@@ -601,12 +637,12 @@ export function Workspace() {
           </header>
           <div className="scroll">
             {view === "activity" ? <Activity items={data.notifications} onRead={async () => { await markNotificationsRead(); await refresh(); }} /> : null}
-            {view === "automations" ? <Automations data={data} onChange={refresh} setNotice={setNotice} /> : null}
-            {view === "bots" ? <Bots data={data} onChange={refresh} setNotice={setNotice} /> : null}
-            {view === "integrations" ? <Integrations data={data} onChange={refresh} setNotice={setNotice} /> : null}
-            {view === "files" ? <Files /> : null}
-            {view === "analytics" ? <Stats /> : null}
-            {view === "members" ? <Members data={data} onChange={refresh} setNotice={setNotice} /> : null}
+            {view === "automations" && isStaff(data.me.role) ? <Automations data={data} onChange={refresh} setNotice={setNotice} /> : null}
+            {view === "bots" && isStaff(data.me.role) ? <Bots data={data} onChange={refresh} setNotice={setNotice} /> : null}
+            {view === "integrations" && isStaff(data.me.role) ? <Integrations data={data} onChange={refresh} setNotice={setNotice} /> : null}
+            {view === "files" ? <Files onError={setNotice} /> : null}
+            {view === "analytics" && isStaff(data.me.role) ? <Stats /> : null}
+            {view === "members" ? <Members data={data} onChange={refresh} setNotice={setNotice} onOpen={(id) => openFocus({ kind: "conversation", id })} /> : null}
             {view === "settings" ? <SettingsPanel data={data} onChange={refresh} setNotice={setNotice} /> : null}
             {view === "admin" ? <Admin data={data} onChange={refresh} setNotice={setNotice} /> : null}
             {view === "inbox" || view === "dms" || view === "channels" ? <p className="text-muted">Choose a channel or direct message.</p> : null}
@@ -628,7 +664,10 @@ export function Workspace() {
               <select className="field mt-1" defaultValue="" onChange={(e) => {
                 const label = e.target.value;
                 if (!label || !focus) return;
-                void updateThread({ data: { kind: focus.kind, id: focus.id, label } }).then(refresh);
+                void updateThread({ data: { kind: focus.kind, id: focus.id, label } }).then((r) => {
+                  if (!r.ok) setNotice(r.error);
+                  return refresh();
+                });
               }}>
                 <option value="">Choose</option>
                 {data.labels.map((l) => <option key={l}>{l}</option>)}
@@ -637,7 +676,10 @@ export function Workspace() {
             <label className="block text-xs text-muted">Assign
               <select className="field mt-1" defaultValue="" onChange={(e) => {
                 if (!e.target.value || !focus) return;
-                void updateThread({ data: { kind: focus.kind, id: focus.id, assigneeId: e.target.value } }).then(refresh);
+                void updateThread({ data: { kind: focus.kind, id: focus.id, assigneeId: e.target.value } }).then((r) => {
+                  if (!r.ok) setNotice(r.error);
+                  return refresh();
+                });
               }}>
                 <option value="">Choose teammate</option>
                 {data.members.map((m) => <option key={m.user_id} value={m.user_id}>{m.display_name}</option>)}
@@ -650,7 +692,10 @@ export function Workspace() {
               const note = String(fd.get("note") ?? "");
               e.currentTarget.reset();
               if (!focus) return;
-              void updateThread({ data: { kind: focus.kind, id: focus.id, note } }).then(refresh);
+              void updateThread({ data: { kind: focus.kind, id: focus.id, note } }).then((r) => {
+                if (!r.ok) setNotice(r.error);
+                return refresh();
+              });
             }}>
               <textarea name="note" className="field" placeholder="Internal note. Not visible as a chat message." rows={3} />
               <button className="btn tiny mt-2" type="submit">Save note</button>
@@ -659,9 +704,20 @@ export function Workspace() {
               <p key={n.id} className="rounded-lg bg-paper p-2">{n.body}<span className="block text-xs text-muted">{n.authorName}</span></p>
             ))}
             {focus.kind === "conversation" ? (
-              <button type="button" className="btn ghost tiny" onClick={() => void setConversationFlags({ data: { id: focus.id, archived: true } }).then(async () => { setFocus(null); await refresh(); })}>
-                Archive conversation
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" className="btn ghost tiny" onClick={() => void setConversationFlags({ data: { id: focus.id, muted: true } }).then(async (r) => {
+                  if (!r.ok) setNotice(r.error);
+                  else setNotice("Muted.");
+                  await refresh();
+                })}>Mute</button>
+                {isStaff(data.me.role) ? (
+                  <button type="button" className="btn ghost tiny" onClick={() => void setConversationFlags({ data: { id: focus.id, archived: true } }).then(async (r) => {
+                    if (!r.ok) { setNotice(r.error); return; }
+                    setFocus(null);
+                    await refresh();
+                  })}>Archive for everyone</button>
+                ) : null}
+              </div>
             ) : null}
           </div>
         </aside>
@@ -730,13 +786,16 @@ function GroupForm({
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [ids, setIds] = useState<string[]>([]);
+  const [error, setError] = useState("");
   if (!open) return <button type="button" className="btn ghost w-full" onClick={() => setOpen(true)}>New group</button>;
   return (
     <form className="space-y-2" onSubmit={(e) => {
       e.preventDefault();
       void createGroup({ data: { name, memberIds: ids } }).then(async (r) => {
-        if (r.ok) { setOpen(false); await onDone(r.id); }
-      });
+        if (!r.ok) { setError(r.error); return; }
+        setOpen(false);
+        await onDone(r.id);
+      }).catch((err) => setError(errText(err)));
     }}>
       <input className="field" placeholder="Group name" value={name} onChange={(e) => setName(e.target.value)} />
       <div className="max-h-28 space-y-1 overflow-auto text-sm">
@@ -750,6 +809,7 @@ function GroupForm({
         ))}
       </div>
       <button className="btn w-full" type="submit">Create group</button>
+      {error ? <p className="text-sm text-danger">{error}</p> : null}
     </form>
   );
 }
@@ -764,6 +824,7 @@ function ThreadMeta({
   const [followUpOn, setFollow] = useState(detail.followUpOn);
   const [candidateRef, setRef] = useState(detail.candidateRef);
   const [status, setStatus] = useState(detail.status || "open");
+  const [error, setError] = useState("");
   useEffect(() => {
     setFollow(detail.followUpOn);
     setRef(detail.candidateRef);
@@ -772,7 +833,11 @@ function ThreadMeta({
   return (
     <form className="space-y-2" onSubmit={(e) => {
       e.preventDefault();
-      void updateThread({ data: { kind: focus.kind, id: focus.id, followUpOn, candidateRef, status } }).then(onSave);
+      void updateThread({ data: { kind: focus.kind, id: focus.id, followUpOn, candidateRef, status } }).then((r) => {
+        if (!r.ok) { setError(r.error); return; }
+        setError("");
+        return onSave();
+      }).catch((err) => setError(errText(err)));
     }}>
       <input className="field" placeholder="Candidate ref (local only)" value={candidateRef} onChange={(e) => setRef(e.target.value)} />
       <input className="field" type="date" value={followUpOn} onChange={(e) => setFollow(e.target.value)} />
@@ -782,6 +847,7 @@ function ThreadMeta({
         <option value="resolved">Resolved</option>
       </select>
       <button className="btn tiny" type="submit">Save follow-up</button>
+      {error ? <p className="text-sm text-danger">{error}</p> : null}
     </form>
   );
 }
@@ -840,9 +906,9 @@ function Automations({
               <button type="button" className="btn ghost tiny" onClick={() => load(w)}>Edit</button>
             </div>
             <div className="mt-2 flex flex-wrap gap-2">
-              <button type="button" className="btn ghost tiny" onClick={() => void setWorkflowEnabled({ data: { id: w.id, enabled: !w.enabled } }).then(onChange)}>{w.enabled ? "Disable" : "Enable"}</button>
+              <button type="button" className="btn ghost tiny" onClick={() => void setWorkflowEnabled({ data: { id: w.id, enabled: !w.enabled } }).then((r) => { if (!r.ok) setNotice(r.error); return onChange(); })}>{w.enabled ? "Disable" : "Enable"}</button>
               <button type="button" className="btn ghost tiny" onClick={() => void testWorkflow({ data: { id: w.id } }).then((r) => setNotice(r.ok ? r.detail : r.error)).then(onChange)}>Test</button>
-              <button type="button" className="btn ghost tiny" onClick={() => void duplicateWorkflow({ data: { id: w.id } }).then(onChange)}>Duplicate</button>
+              <button type="button" className="btn ghost tiny" onClick={() => void duplicateWorkflow({ data: { id: w.id } }).then((r) => { if (!r.ok) setNotice(r.error); return onChange(); })}>Duplicate</button>
               <button type="button" className="btn ghost tiny" onClick={() => void deleteWorkflow({ data: { id: w.id } }).then((r) => { if (!r.ok) setNotice(r.error); return onChange(); })}>Delete</button>
             </div>
           </article>
@@ -1027,7 +1093,7 @@ function Integrations({
   );
 }
 
-function Files() {
+function Files({ onError }: { onError: (s: string) => void }) {
   const q = useQuery({ queryKey: ["files"], queryFn: () => listFiles() });
   if (q.isPending) return <p className="text-muted">Loading files you can access…</p>;
   if (!q.data?.length) return <p className="text-muted">No shared files yet. Files already saved in messages stay there. Without Cloudflare R2, new files over 120 KB are refused. With R2, new files up to 8 MB go to a private bucket and open with a five-minute link.</p>;
@@ -1035,7 +1101,7 @@ function Files() {
     <div className="space-y-2">
       {q.data.map((f) => (
         <button key={f.id} type="button" className="card block w-full text-left" onClick={() => void fileData({ data: { id: f.id } }).then((r) => {
-          if (!r.ok) return;
+          if (!r.ok) { onError(r.error); return; }
           const a = document.createElement("a");
           a.href = r.data;
           a.download = r.name;
@@ -1100,11 +1166,12 @@ function Stats() {
 }
 
 function Members({
-  data, onChange, setNotice,
+  data, onChange, setNotice, onOpen,
 }: {
   data: Awaited<ReturnType<typeof bootstrap>>;
   onChange: () => Promise<void>;
   setNotice: (s: string) => void;
+  onOpen: (id: string) => void;
 }) {
   return (
     <div className="space-y-2">
@@ -1116,7 +1183,7 @@ function Members({
           </div>
           <button type="button" className="btn ghost tiny" onClick={() => void openDm({ data: { userId: m.user_id } }).then((r) => {
             if (!r.ok) setNotice(r.error);
-            else setNotice("Direct message is in Direct. Switch to that tab.");
+            else onOpen(r.id);
             return onChange();
           })}>Message</button>
         </article>
@@ -1144,7 +1211,7 @@ function SettingsPanel({
         void updateProfile({ data: { displayName, presence: presence as "active" | "away" | "offline", notifyPref: notifyPref as "all" | "mentions" | "off" } }).then(async () => {
           setNotice("Profile saved.");
           await onChange();
-        });
+        }).catch((err) => setNotice(errText(err)));
       }}>
         <h2 className="font-medium">Your profile</h2>
         <input className="field" value={displayName} onChange={(e) => setName(e.target.value)} />
@@ -1223,10 +1290,9 @@ function Admin({
   onChange: () => Promise<void>;
   setNotice: (s: string) => void;
 }) {
-  const audit = useQuery({ queryKey: ["audit"], queryFn: () => listAudit() });
+  const audit = useQuery({ queryKey: ["audit"], queryFn: () => listAudit(), enabled: isAdmin(data.me.role) });
   const [role, setRoleChoice] = useState<"member" | "manager" | "administrator" | "guest">("member");
-  const staff = data.me.role === "owner" || data.me.role === "administrator" || data.me.role === "manager";
-  if (!staff) return <p className="text-muted">Administration is limited to owners, administrators, and managers.</p>;
+  if (!isAdmin(data.me.role)) return <p className="text-muted">Administration is limited to the owner and administrators.</p>;
   return (
     <div className="space-y-4">
       <form className="card space-y-2" onSubmit={(e) => {
@@ -1246,11 +1312,11 @@ function Admin({
         {data.members.map((m) => (
           <div key={m.user_id} className="card flex flex-wrap items-center justify-between gap-2">
             <p>{m.display_name}</p>
-            <select className="field max-w-48" value={m.role} onChange={(e) => void setRole({ data: { userId: m.user_id, role: e.target.value as "owner" | "administrator" | "manager" | "member" | "guest" } }).then(async (r) => {
+            <select className="field max-w-48" value={m.role} disabled={m.role === "owner" && data.me.role !== "owner"} onChange={(e) => void setRole({ data: { userId: m.user_id, role: e.target.value as "owner" | "administrator" | "manager" | "member" | "guest" } }).then(async (r) => {
               if (!r.ok) setNotice(r.error);
               await onChange();
             })}>
-              <option value="owner">Owner</option>
+              <option value="owner" disabled={data.me.role !== "owner"}>Owner</option>
               <option value="administrator">Administrator</option>
               <option value="manager">Manager</option>
               <option value="member">Member</option>

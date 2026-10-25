@@ -66,6 +66,7 @@ test("sign-in copies the auth schema into the glob and keeps the source", () => 
       "0003_ops.sql",
       "0004_reliability.sql",
       "0005_r2.sql",
+      "0006_access.sql",
     ],
   );
   assert.ok(readdirSync(join(migrationsDir, "auth")).includes("0001_auth.sql"));

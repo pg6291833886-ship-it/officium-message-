@@ -80,11 +80,8 @@ function clean(s: string, max: number) {
   return s.replaceAll("\u0000", "").trim().slice(0, max);
 }
 
-type Role = "owner" | "administrator" | "manager" | "member" | "guest";
-
-function isStaff(role: string) {
-  return role === "owner" || role === "administrator" || role === "manager";
-}
+import { canChangeRole, canInvite, canRedeemInvite, canSeeChannel, initialRole, isAdmin, isStaff, normalizeRole, type Role } from "./access.ts";
+import { VISIBLE_MESSAGE_SQL } from "./visibility.ts";
 
 async function audit(sql: Sql, actor: string, action: string, detail: string) {
   await sql`
@@ -94,6 +91,21 @@ async function audit(sql: Sql, actor: string, action: string, detail: string) {
 }
 
 async function ensure(sql: Sql, userId: string) {
+  const existing = await sql<{ role: string; display_name: string; email: string; presence: string; notify_pref: string }>`
+    select m.role, p.display_name, p.email, p.presence, p.notify_pref
+    from memberships m
+    join profiles p on p.user_id = m.user_id
+    where m.workspace_id = ${WS} and m.user_id = ${userId}
+  `;
+  if (existing[0]) {
+    return {
+      role: normalizeRole(existing[0].role),
+      name: existing[0].display_name,
+      email: existing[0].email,
+      presence: existing[0].presence || "active",
+      notifyPref: existing[0].notify_pref || "all",
+    };
+  }
   const people = await sql<{ name: string; email: string }>`
     select "name" as name, "email" as email from "user" where "id" = ${userId}
   `;
@@ -112,7 +124,7 @@ async function ensure(sql: Sql, userId: string) {
   const owners = await sql<{ n: number }>`
     select count(*)::int as n from memberships where workspace_id = ${WS} and role = 'owner'
   `;
-  const role: Role = (owners[0]?.n ?? 0) === 0 ? "owner" : "member";
+  const role: Role = initialRole(owners[0]?.n);
   await sql`
     insert into memberships (workspace_id, user_id, role)
     values (${WS}, ${userId}, ${role})
@@ -125,12 +137,14 @@ async function ensure(sql: Sql, userId: string) {
       on conflict (id) do nothing
     `;
   }
-  await sql`
-    insert into channel_members (channel_id, user_id)
-    select c.id, ${userId} from channels c
-    where c.workspace_id = ${WS} and c.visibility = 'public'
-    on conflict (channel_id, user_id) do nothing
-  `;
+  if (role !== "guest") {
+    await sql`
+      insert into channel_members (channel_id, user_id)
+      select c.id, ${userId} from channels c
+      where c.workspace_id = ${WS} and c.visibility = 'public'
+      on conflict (channel_id, user_id) do nothing
+    `;
+  }
   for (const [id, botName, description] of BOTS) {
     await sql`
       insert into bots (id, workspace_id, name, description, enabled, system, created_by)
@@ -177,7 +191,7 @@ async function ensure(sql: Sql, userId: string) {
     select display_name, email, presence, notify_pref from profiles where user_id = ${userId}
   `;
   return {
-    role: (mem[0]?.role ?? "member") as Role,
+    role: normalizeRole(mem[0]?.role),
     name: profile[0]?.display_name ?? name,
     email: profile[0]?.email ?? email,
     presence: profile[0]?.presence ?? "active",
@@ -190,11 +204,16 @@ async function assertChannel(sql: Sql, userId: string, channelId: string) {
     select visibility, archived from channels where id = ${channelId} and workspace_id = ${WS}
   `;
   if (!rows[0] || rows[0].archived) throw new Error("Channel not found.");
-  if (rows[0].visibility === "private") {
-    const m = await sql<{ ok: number }>`
-      select 1 as ok from channel_members where channel_id = ${channelId} and user_id = ${userId}
-    `;
-    if (!m[0]) throw new Error("This private channel is only visible to its members.");
+  const member = await sql<{ ok: number }>`
+    select 1 as ok from channel_members where channel_id = ${channelId} and user_id = ${userId}
+  `;
+  const roleRow = await sql<{ role: string }>`
+    select role from memberships where workspace_id = ${WS} and user_id = ${userId}
+  `;
+  if (!canSeeChannel({ visibility: rows[0].visibility, member: Boolean(member[0]), role: roleRow[0]?.role })) {
+    throw new Error(rows[0].visibility === "private"
+      ? "This private channel is only visible to its members."
+      : "This channel is not available to your account.");
   }
 }
 
@@ -240,12 +259,27 @@ type MsgRow = {
   attachment_data: string | null;
 };
 
-async function loadMessages(sql: Sql, column: "channel_id" | "conversation_id", param: string, viewer: string) {
+const MESSAGE_PAGE = 80;
+
+async function loadMessages(sql: Sql, column: "channel_id" | "conversation_id", param: string, viewer: string, before?: string) {
   const rows = await sql.query<MsgRow>(
     `select id, body, author_id, created_at, edited_at, deleted, pinned, reply_to_id, attachment_name, attachment_data
-     from messages where ${column} = $1 and workspace_id = $2
-     order by created_at asc limit 200`,
-    [param, WS],
+     from (
+       select id, body, author_id, created_at, edited_at, deleted, pinned, reply_to_id, attachment_name,
+              case
+                when attachment_data is null then null
+                when attachment_data like 'r2:%' or attachment_data like 's3:%' then attachment_data
+                when attachment_data like 'data:image/%' and octet_length(attachment_data) <= 20000 then attachment_data
+                else ''
+              end as attachment_data
+       from messages
+       where ${column} = $1 and workspace_id = $2
+         and ($3::text is null or created_at < $3::timestamptz)
+       order by created_at desc
+       limit ${MESSAGE_PAGE}
+     ) page
+     order by created_at asc`,
+    [param, WS, before || null],
   );
   const ids = rows.map((r) => r.id);
   const reacts = ids.length
@@ -645,14 +679,29 @@ async function threadSide(sql: Sql, kind: string, id: string) {
   };
 }
 
-async function sidebar(sql: Sql, userId: string) {
+async function latestPreview(sql: Sql, column: "channel_id" | "conversation_id", ids: string[]) {
+  const out = new Map<string, { preview: string; at: string }>();
+  if (!ids.length) return out;
+  const rows = await sql.query<{ id: string; body: string; created_at: unknown }>(
+    `select distinct on (${column}) ${column} as id, body, created_at
+     from messages
+     where deleted = false and ${column} in (${ids.map((_, i) => `$${i + 1}`).join(",")})
+     order by ${column}, created_at desc`,
+    ids,
+  );
+  for (const row of rows) out.set(row.id, { preview: (row.body ?? "").slice(0, 80), at: iso(row.created_at) });
+  return out;
+}
+
+async function sidebar(sql: Sql, userId: string, role: string) {
   const channels = await sql<{ id: string; name: string; topic: string; visibility: string; description: string }>`
     select c.id, c.name, c.topic, c.visibility, c.description
     from channels c
     where c.workspace_id = ${WS} and c.archived = false
-      and (c.visibility = 'public' or exists (
-        select 1 from channel_members cm where cm.channel_id = c.id and cm.user_id = ${userId}
-      ))
+      and (
+        exists (select 1 from channel_members cm where cm.channel_id = c.id and cm.user_id = ${userId})
+        or (c.visibility = 'public' and ${role} in ('owner', 'administrator', 'manager', 'member'))
+      )
     order by c.name
   `;
   const convos = await sql<{ id: string; kind: string; name: string; muted: boolean }>`
@@ -662,32 +711,34 @@ async function sidebar(sql: Sql, userId: string) {
     where c.workspace_id = ${WS} and c.archived = false
     order by c.created_at desc
   `;
-  const previews = await sql<{ channel_id: string | null; conversation_id: string | null; body: string; created_at: unknown }>`
-    select channel_id, conversation_id, body, created_at from messages
-    where workspace_id = ${WS} and deleted = false
-    order by created_at desc limit 300
-  `;
-  const previewOf = (channelId: string | null, conversationId: string | null) => {
-    const hit = previews.find((p) => (channelId ? p.channel_id === channelId : p.conversation_id === conversationId));
-    return { preview: hit?.body.slice(0, 80) ?? "", at: hit ? iso(hit.created_at) : "" };
-  };
-  const channelUnread = await sql<{ channel_id: string; n: number }>`
-    select m.channel_id, count(*)::int as n
-    from messages m
-    left join channel_reads r on r.channel_id = m.channel_id and r.user_id = ${userId}
-    where m.workspace_id = ${WS} and m.channel_id is not null and m.deleted = false
-      and m.author_id <> ${userId}
-      and m.created_at > coalesce(r.last_read_at, '1970-01-01'::timestamptz)
-    group by m.channel_id
-  `;
-  const convoUnread = await sql<{ conversation_id: string; n: number }>`
-    select m.conversation_id, count(*)::int as n
-    from messages m
-    join conversation_members cm on cm.conversation_id = m.conversation_id and cm.user_id = ${userId}
-    where m.deleted = false and m.author_id <> ${userId}
-      and m.created_at > coalesce(cm.last_read_at, '1970-01-01'::timestamptz)
-    group by m.conversation_id
-  `;
+  const channelIds = channels.map((c) => c.id);
+  const convoIds = convos.map((c) => c.id);
+  const channelPreview = await latestPreview(sql, "channel_id", channelIds);
+  const convoPreview = await latestPreview(sql, "conversation_id", convoIds);
+  const channelUnread = channelIds.length
+    ? await sql.query<{ channel_id: string; n: number }>(
+        `select m.channel_id, count(*)::int as n
+         from messages m
+         left join channel_reads r on r.channel_id = m.channel_id and r.user_id = $1
+         where m.deleted = false and m.author_id <> $1
+           and m.channel_id in (${channelIds.map((_, i) => `$${i + 2}`).join(",")})
+           and m.created_at > coalesce(r.last_read_at, '1970-01-01'::timestamptz)
+         group by m.channel_id`,
+        [userId, ...channelIds],
+      )
+    : [];
+  const convoUnread = convoIds.length
+    ? await sql.query<{ conversation_id: string; n: number }>(
+        `select m.conversation_id, count(*)::int as n
+         from messages m
+         join conversation_members cm on cm.conversation_id = m.conversation_id and cm.user_id = $1
+         where m.deleted = false and m.author_id <> $1
+           and m.conversation_id in (${convoIds.map((_, i) => `$${i + 2}`).join(",")})
+           and m.created_at > coalesce(cm.last_read_at, '1970-01-01'::timestamptz)
+         group by m.conversation_id`,
+        [userId, ...convoIds],
+      )
+    : [];
   const unreadC = new Map(channelUnread.map((r) => [r.channel_id, r.n]));
   const unreadD = new Map(convoUnread.map((r) => [r.conversation_id, r.n]));
   const parts = convos.length
@@ -700,21 +751,21 @@ async function sidebar(sql: Sql, userId: string) {
     : [];
   return {
     channels: channels.map((c) => {
-      const p = previewOf(c.id, null);
-      return { ...c, preview: p.preview, at: p.at, unread: unreadC.get(c.id) ?? 0 };
+      const p = channelPreview.get(c.id);
+      return { ...c, preview: p?.preview ?? "", at: p?.at ?? "", unread: unreadC.get(c.id) ?? 0 };
     }),
     conversations: convos.map((c) => {
       const people = parts.filter((p) => p.conversation_id === c.id && p.user_id !== userId);
       const title = c.kind === "dm" ? (people.map((p) => p.display_name).join(", ") || "Direct message") : (c.name || "Group");
-      const p = previewOf(null, c.id);
+      const p = convoPreview.get(c.id);
       return {
         id: c.id,
         kind: c.kind,
         name: title,
         muted: c.muted,
         presence: c.kind === "dm" ? (people[0]?.presence ?? "offline") : "",
-        preview: p.preview,
-        at: p.at,
+        preview: p?.preview ?? "",
+        at: p?.at ?? "",
         unread: unreadD.get(c.id) ?? 0,
       };
     }),
@@ -732,7 +783,7 @@ export const bootstrap = createServerFn({ method: "POST" })
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
     await sql`update profiles set presence = 'active' where user_id = ${context.userId}`;
-    const side = await sidebar(sql, context.userId);
+    const side = await sidebar(sql, context.userId, me.role);
     const members = await sql<{ user_id: string; display_name: string; email: string; role: string; presence: string }>`
       select p.user_id, p.display_name, p.email, m.role, p.presence
       from memberships m join profiles p on p.user_id = m.user_id
@@ -747,21 +798,32 @@ export const bootstrap = createServerFn({ method: "POST" })
       where workspace_id = ${WS} and user_id = ${context.userId}
       order by due_at asc limit 30
     `;
-    const workflows = await sql<{ id: string; name: string; description: string; enabled: boolean; config_json: string; last_run_at: unknown }>`
-      select id, name, description, enabled, config_json, last_run_at from workflows where workspace_id = ${WS} order by created_at
-    `;
-    const runs = await sql<{ id: string; workflow_id: string; status: string; detail: string; created_at: unknown }>`
-      select id, workflow_id, status, detail, created_at from workflow_runs where workspace_id = ${WS} order by created_at desc limit 30
-    `;
-    const bots = await sql<{ id: string; name: string; description: string; enabled: boolean; system: boolean }>`
-      select id, name, description, enabled, system from bots where workspace_id = ${WS} order by name
-    `;
-    const logs = await sql<{ id: string; command: string; result: string; created_at: unknown }>`
-      select id, command, result, created_at from bot_logs where workspace_id = ${WS} order by created_at desc limit 20
-    `;
-    const integrations = await sql<{ provider: string; status: string; note: string }>`
-      select provider, status, note from integrations where workspace_id = ${WS} order by provider
-    `;
+    const staff = isStaff(me.role);
+    const workflows = staff
+      ? await sql<{ id: string; name: string; description: string; enabled: boolean; config_json: string; last_run_at: unknown }>`
+          select id, name, description, enabled, config_json, last_run_at from workflows where workspace_id = ${WS} order by created_at
+        `
+      : [];
+    const runs = staff
+      ? await sql<{ id: string; workflow_id: string; status: string; detail: string; created_at: unknown }>`
+          select id, workflow_id, status, detail, created_at from workflow_runs where workspace_id = ${WS} order by created_at desc limit 30
+        `
+      : [];
+    const bots = staff
+      ? await sql<{ id: string; name: string; description: string; enabled: boolean; system: boolean }>`
+          select id, name, description, enabled, system from bots where workspace_id = ${WS} order by name
+        `
+      : [];
+    const logs = staff
+      ? await sql<{ id: string; command: string; result: string; created_at: unknown }>`
+          select id, command, result, created_at from bot_logs where workspace_id = ${WS} order by created_at desc limit 20
+        `
+      : [];
+    const integrations = staff
+      ? await sql<{ provider: string; status: string; note: string }>`
+          select provider, status, note from integrations where workspace_id = ${WS} order by provider
+        `
+      : [];
     const notesN = await sql<{ n: number }>`select count(*)::int as n from notifications where user_id = ${context.userId} and read = false`;
     const notifications = await sql<{ id: string; body: string; read: boolean; created_at: unknown }>`
       select id, body, read, created_at from notifications where user_id = ${context.userId} order by created_at desc limit 25
@@ -779,7 +841,7 @@ export const bootstrap = createServerFn({ method: "POST" })
       workspace: { id: WS, name: "Officium Connect" },
       labels: [...LABELS],
       ...side,
-      members,
+      members: members.map((m) => ({ ...m, email: me.role === "guest" ? "" : m.email })),
       tasks: tasks.map((t) => ({ id: t.id, title: t.title, status: t.status, createdAt: iso(t.created_at) })),
       reminders: reminders.map((r) => ({ id: r.id, body: r.body, dueAt: iso(r.due_at), done: r.done })),
       workflows: workflows.map((w) => ({
@@ -940,9 +1002,13 @@ export const pulse = createServerFn({ method: "POST" })
   .validator((input: unknown) => focusSchema.parse(input ?? {}))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
-    const maintenance = await runMaintenance(sql);
-    const side = await sidebar(sql, context.userId);
+    const me = await ensure(sql, context.userId);
+    const now = Date.now();
+    const gate = globalThis as typeof globalThis & { __officiumMaintAt?: number };
+    const due = !gate.__officiumMaintAt || now - gate.__officiumMaintAt > 60_000;
+    if (due) gate.__officiumMaintAt = now;
+    const maintenance = due ? await runMaintenance(sql) : { reminders: [] as string[], jobs: 0, schedules: 0 };
+    const side = await sidebar(sql, context.userId, me.role);
     let messages: Awaited<ReturnType<typeof loadMessages>> = [];
     let detail: Awaited<ReturnType<typeof threadSide>> | null = null;
     let typing: { name: string }[] = [];
@@ -962,7 +1028,37 @@ export const pulse = createServerFn({ method: "POST" })
     const unreadNotifications = await sql<{ n: number }>`
       select count(*)::int as n from notifications where user_id = ${context.userId} and read = false
     `;
-    return { ...side, messages, detail, typing, firedReminders: maintenance.reminders, unreadNotifications: unreadNotifications[0]?.n ?? 0 };
+    return {
+      ...side,
+      messages,
+      olderAvailable: messages.length >= MESSAGE_PAGE,
+      detail,
+      typing,
+      firedReminders: maintenance.reminders,
+      unreadNotifications: unreadNotifications[0]?.n ?? 0,
+    };
+  });
+
+export const olderMessages = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .validator((input: unknown) => z.object({
+    kind: z.enum(["channel", "conversation"]),
+    id: z.string().min(1).max(80),
+    before: z.string().min(1).max(40),
+  }).parse(input))
+  .handler(async ({ context, data }) => {
+    const sql = await getSql();
+    await ensure(sql, context.userId);
+    if (data.kind === "channel") await assertChannel(sql, context.userId, data.id);
+    else await assertConvo(sql, context.userId, data.id);
+    const messages = await loadMessages(
+      sql,
+      data.kind === "channel" ? "channel_id" : "conversation_id",
+      data.id,
+      context.userId,
+      data.before,
+    );
+    return { ok: true as const, messages };
   });
 
 const sendSchema = z.object({
@@ -1222,7 +1318,7 @@ export const createChannel = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role === "guest") return { ok: false as const, error: "Guests cannot create channels." };
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can create channels." };
     const name = clean(data.name, 40).toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-");
     if (name.length < 2) return { ok: false as const, error: "Use letters, numbers, or hyphens." };
     const id = nid("ch");
@@ -1234,7 +1330,8 @@ export const createChannel = createServerFn({ method: "POST" })
     if (data.visibility === "public") {
       await sql`
         insert into channel_members (channel_id, user_id)
-        select ${id}, user_id from memberships where workspace_id = ${WS}
+        select ${id}, user_id from memberships
+        where workspace_id = ${WS} and role in ('owner', 'administrator', 'manager', 'member')
         on conflict (channel_id, user_id) do nothing
       `;
     }
@@ -1301,42 +1398,38 @@ export const searchAll = createServerFn({ method: "POST" })
   .validator((input: unknown) => z.object({ q: z.string().min(2).max(80) }).parse(input))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
+    const me = await ensure(sql, context.userId);
     const q = `%${clean(data.q, 80).replace(/[%_]/g, "")}%`;
-    const messages = await sql<{ id: string; body: string; channel_id: string | null; conversation_id: string | null; created_at: unknown }>`
-      select m.id, m.body, m.channel_id, m.conversation_id, m.created_at
-      from messages m
-      where m.workspace_id = ${WS} and m.deleted = false and m.body ilike ${q}
-        and (
-          (m.channel_id is not null and (
-            exists (select 1 from channels c where c.id = m.channel_id and c.visibility = 'public' and c.workspace_id = ${WS})
-            or exists (select 1 from channel_members cm where cm.channel_id = m.channel_id and cm.user_id = ${context.userId})
-          ))
-          or (m.conversation_id is not null and exists (
-            select 1 from conversation_members mem where mem.conversation_id = m.conversation_id and mem.user_id = ${context.userId}
-          ))
-        )
-      order by m.created_at desc limit 25
-    `;
-    const people = await sql<{ user_id: string; display_name: string }>`
-      select p.user_id, p.display_name from profiles p
-      join memberships m on m.user_id = p.user_id and m.workspace_id = ${WS}
-      where p.display_name ilike ${q} or p.email ilike ${q}
-      limit 8
-    `;
-    const files = await sql<{ id: string; attachment_name: string; channel_id: string | null; conversation_id: string | null }>`
-      select m.id, m.attachment_name, m.channel_id, m.conversation_id
-      from messages m
-      where m.workspace_id = ${WS} and m.deleted = false and m.attachment_name ilike ${q}
-        and (
-          (m.channel_id is not null and (
-            exists (select 1 from channels c where c.id = m.channel_id and c.visibility = 'public')
-            or exists (select 1 from channel_members cm where cm.channel_id = m.channel_id and cm.user_id = ${context.userId})
-          ))
-          or exists (select 1 from conversation_members mem where mem.conversation_id = m.conversation_id and mem.user_id = ${context.userId})
-        )
-      limit 10
-    `;
+    const messages = await sql.query<{ id: string; body: string; channel_id: string | null; conversation_id: string | null; created_at: unknown }>(
+      `select m.id, m.body, m.channel_id, m.conversation_id, m.created_at
+       from messages m
+       where m.workspace_id = $2 and m.deleted = false and m.body ilike $3
+         and ${VISIBLE_MESSAGE_SQL}
+       order by m.created_at desc
+       limit 25`,
+      [context.userId, WS, q],
+    );
+    const people = me.role === "guest"
+      ? await sql<{ user_id: string; display_name: string }>`
+          select p.user_id, p.display_name from profiles p
+          join memberships m on m.user_id = p.user_id and m.workspace_id = ${WS}
+          where p.display_name ilike ${q}
+          limit 8
+        `
+      : await sql<{ user_id: string; display_name: string }>`
+          select p.user_id, p.display_name from profiles p
+          join memberships m on m.user_id = p.user_id and m.workspace_id = ${WS}
+          where p.display_name ilike ${q} or p.email ilike ${q}
+          limit 8
+        `;
+    const files = await sql.query<{ id: string; attachment_name: string; channel_id: string | null; conversation_id: string | null }>(
+      `select m.id, m.attachment_name, m.channel_id, m.conversation_id
+       from messages m
+       where m.workspace_id = $2 and m.deleted = false and m.attachment_name ilike $3
+         and ${VISIBLE_MESSAGE_SQL}
+       limit 10`,
+      [context.userId, WS, q],
+    );
     return {
       messages: messages.map((m) => ({
         id: m.id, body: m.body.slice(0, 160), channelId: m.channel_id ?? "", conversationId: m.conversation_id ?? "", createdAt: iso(m.created_at),
@@ -1360,7 +1453,7 @@ export const saveWorkflow = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role === "guest") return { ok: false as const, error: "Guests cannot edit workflows." };
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can edit workflows." };
     let parsed: WfConfig;
     try { parsed = JSON.parse(data.configJson) as WfConfig; } catch { return { ok: false as const, error: "Workflow config is not valid JSON." }; }
     if (!parsed.trigger?.type || !Array.isArray(parsed.actions) || parsed.actions.length === 0) {
@@ -1398,7 +1491,7 @@ export const setWorkflowEnabled = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role === "guest") return { ok: false as const, error: "Not allowed." };
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can change workflows." };
     await sql`update workflows set enabled = ${data.enabled} where id = ${data.id} and workspace_id = ${WS}`;
     return { ok: true as const };
   });
@@ -1408,7 +1501,8 @@ export const testWorkflow = createServerFn({ method: "POST" })
   .validator((input: unknown) => z.object({ id: z.string().min(1).max(80) }).parse(input))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
+    const me = await ensure(sql, context.userId);
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can test workflows." };
     const rows = await sql<{ name: string; config_json: string }>`select name, config_json from workflows where id = ${data.id} and workspace_id = ${WS}`;
     if (!rows[0]) return { ok: false as const, error: "Workflow not found." };
     try {
@@ -1428,7 +1522,7 @@ export const duplicateWorkflow = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role === "guest") return { ok: false as const, error: "Not allowed." };
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can change workflows." };
     const rows = await sql<{ name: string; description: string; config_json: string }>`
       select name, description, config_json from workflows where id = ${data.id} and workspace_id = ${WS}
     `;
@@ -1550,7 +1644,8 @@ export const saveTask = createServerFn({ method: "POST" })
   }).parse(input))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
+    const me = await ensure(sql, context.userId);
+    if (me.role === "guest") return { ok: false as const, error: "Guests cannot change tasks." };
     if (data.id && data.done !== undefined) {
       await sql`update tasks set status = ${data.done ? "done" : "open"} where id = ${data.id} and workspace_id = ${WS}`;
       return { ok: true as const };
@@ -1598,12 +1693,19 @@ export const setRole = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role !== "owner" && me.role !== "administrator") return { ok: false as const, error: "Only an owner or administrator can change roles." };
-    if (data.role === "owner" && me.role !== "owner") return { ok: false as const, error: "Only an owner can grant ownership." };
-    if (data.userId === context.userId && me.role === "owner" && data.role !== "owner") {
-      const owners = await sql<{ n: number }>`select count(*)::int as n from memberships where workspace_id = ${WS} and role = 'owner'`;
-      if ((owners[0]?.n ?? 0) < 2) return { ok: false as const, error: "Keep at least one owner." };
-    }
+    const target = await sql<{ role: string }>`
+      select role from memberships where workspace_id = ${WS} and user_id = ${data.userId}
+    `;
+    if (!target[0]) return { ok: false as const, error: "Member not found." };
+    const owners = await sql<{ n: number }>`select count(*)::int as n from memberships where workspace_id = ${WS} and role = 'owner'`;
+    const decision = canChangeRole({
+      actorRole: me.role,
+      targetRole: target[0].role,
+      self: data.userId === context.userId,
+      nextRole: data.role,
+      ownerCount: owners[0]?.n,
+    });
+    if (!decision.ok) return decision;
     const updated = await sql<{ user_id: string }>`
       update memberships set role = ${data.role}
       where workspace_id = ${WS} and user_id = ${data.userId}
@@ -1620,7 +1722,8 @@ export const createInvite = createServerFn({ method: "POST" })
   .handler(async ({ context, data }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (me.role !== "owner" && me.role !== "administrator") return { ok: false as const, error: "Only administrators can invite." };
+    const decision = canInvite(me.role, data.role);
+    if (!decision.ok) return decision;
     const code = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     await sql`insert into invites (code, workspace_id, role, created_by) values (${code}, ${WS}, ${data.role}, ${context.userId})`;
     await audit(sql, context.userId, "invite", data.role);
@@ -1632,16 +1735,17 @@ export const redeemInvite = createServerFn({ method: "POST" })
   .validator((input: unknown) => z.object({ code: z.string().min(4).max(20) }).parse(input))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
+    const me = await ensure(sql, context.userId);
     const rows = await sql<{ role: string }>`select role from invites where code = ${clean(data.code, 20)} and workspace_id = ${WS}`;
     if (!rows[0]) return { ok: false as const, error: "Invite code was not found." };
-    if (rows[0].role === "owner") return { ok: false as const, error: "That invite cannot be used." };
+    const decision = canRedeemInvite(me.role, rows[0].role);
+    if (!decision.ok) return decision;
     await sql`
-      update memberships set role = ${rows[0].role}
+      update memberships set role = ${decision.role}
       where workspace_id = ${WS} and user_id = ${context.userId} and role <> 'owner'
     `;
-    await audit(sql, context.userId, "redeem_invite", rows[0].role);
-    return { ok: true as const, role: rows[0].role };
+    await audit(sql, context.userId, "redeem_invite", decision.role);
+    return { ok: true as const, role: decision.role };
   });
 
 export const analytics = createServerFn({ method: "POST" })
@@ -1650,6 +1754,7 @@ export const analytics = createServerFn({ method: "POST" })
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
     if (me.role === "guest") return { ok: false as const, error: "Guests cannot view analytics." };
+    if (!isStaff(me.role)) return { ok: false as const, error: "Only managers can view analytics." };
     const messages = await sql<{ n: number }>`select count(*)::int as n from messages where workspace_id = ${WS} and deleted = false`;
     const users = await sql<{ n: number }>`select count(*)::int as n from memberships where workspace_id = ${WS}`;
     const convos = await sql<{ n: number }>`select count(*)::int as n from conversations where workspace_id = ${WS} and archived = false`;
@@ -1687,19 +1792,15 @@ export const listFiles = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const sql = await getSql();
     await ensure(sql, context.userId);
-    const rows = await sql<{ id: string; attachment_name: string; created_at: unknown; channel_id: string | null; conversation_id: string | null }>`
-      select m.id, m.attachment_name, m.created_at, m.channel_id, m.conversation_id
-      from messages m
-      where m.workspace_id = ${WS} and m.deleted = false and m.attachment_name is not null
-        and (
-          (m.channel_id is not null and (
-            exists (select 1 from channels c where c.id = m.channel_id and c.visibility = 'public')
-            or exists (select 1 from channel_members cm where cm.channel_id = m.channel_id and cm.user_id = ${context.userId})
-          ))
-          or exists (select 1 from conversation_members mem where mem.conversation_id = m.conversation_id and mem.user_id = ${context.userId})
-        )
-      order by m.created_at desc limit 40
-    `;
+    const rows = await sql.query<{ id: string; attachment_name: string; created_at: unknown; channel_id: string | null; conversation_id: string | null }>(
+      `select m.id, m.attachment_name, m.created_at, m.channel_id, m.conversation_id
+       from messages m
+       where m.workspace_id = $2 and m.deleted = false and m.attachment_name is not null
+         and ${VISIBLE_MESSAGE_SQL}
+       order by m.created_at desc
+       limit 40`,
+      [context.userId, WS],
+    );
     return rows.map((r) => ({
       id: r.id, name: r.attachment_name, createdAt: iso(r.created_at), channelId: r.channel_id ?? "", conversationId: r.conversation_id ?? "",
     }));
@@ -1717,6 +1818,7 @@ export const fileData = createServerFn({ method: "POST" })
     `;
     const row = rows[0];
     if (!row) return { ok: false as const, error: "File not found." };
+    if (!row.channel_id && !row.conversation_id) return { ok: false as const, error: "File not found." };
     if (row.channel_id) await assertChannel(sql, context.userId, row.channel_id);
     if (row.conversation_id) await assertConvo(sql, context.userId, row.conversation_id);
     const pointer = remoteFileId(row.attachment_data);
@@ -1908,7 +2010,7 @@ export const listAudit = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const sql = await getSql();
     const me = await ensure(sql, context.userId);
-    if (!isStaff(me.role)) return { ok: false as const, error: "Administrators only." };
+    if (!isAdmin(me.role)) return { ok: false as const, error: "Administrators only." };
     const rows = await sql<{ action: string; detail: string; actor_id: string; created_at: unknown }>`
       select action, detail, actor_id, created_at from audit_logs where workspace_id = ${WS} order by created_at desc limit 40
     `;
@@ -1928,8 +2030,11 @@ export const setConversationFlags = createServerFn({ method: "POST" })
   }).parse(input))
   .handler(async ({ context, data }) => {
     const sql = await getSql();
-    await ensure(sql, context.userId);
+    const me = await ensure(sql, context.userId);
     await assertConvo(sql, context.userId, data.id);
+    if (data.archived !== undefined && !isStaff(me.role)) {
+      return { ok: false as const, error: "Only managers can archive a conversation for everyone." };
+    }
     if (data.muted !== undefined) {
       await sql`update conversation_members set muted = ${data.muted} where conversation_id = ${data.id} and user_id = ${context.userId}`;
     }
