@@ -1169,6 +1169,7 @@ export const sendMessage = createServerFn({ method: "POST" })
             insert into stored_files (id, message_id, name, content_type, size_bytes, storage, object_key, created_by, status)
             values (${fileId}, ${"pending"}, ${attachmentName || "file"}, ${allowed.type}, ${bytes.length}, ${"r2"}, ${key}, ${context.userId}, ${"ready"})
           `;
+          storedAttachment = remotePointer(fileId);
         } catch (err) {
           if (key) {
             try { await removeObject(key); } catch { /* the row was not saved, so a later sweep cannot see this object */ }
@@ -1181,7 +1182,6 @@ export const sendMessage = createServerFn({ method: "POST" })
             values (${fileId}, ${"pending"}, ${attachmentName || "file"}, ${allowed.type}, ${bytes.length}, ${"database"}, ${attachmentData}, ${context.userId}, ${"ready"})
           `;
         }
-        storedAttachment = remotePointer(fileId);
       } else {
         storedAttachment = attachmentData;
         await sql`
@@ -1874,10 +1874,13 @@ export const fileData = createServerFn({ method: "POST" })
     const pointer = remoteFileId(row.attachment_data);
     if (pointer) {
       if (!storageConfigured()) return { ok: false as const, error: storageSetupMessage() };
-      const files = await sql<{ object_key: string | null; name: string; content_type: string }>`
-        select object_key, name, content_type from stored_files
-        where id = ${pointer} and storage in ('s3', 'r2')
+      const files = await sql<{ object_key: string | null; name: string; content_type: string; inline_data: string | null }>`
+        select object_key, name, content_type, inline_data from stored_files
+        where id = ${pointer}
       `;
+      if (files[0]?.inline_data?.startsWith("data:")) {
+        return { ok: true as const, name: files[0].name || row.attachment_name || "file", data: files[0].inline_data };
+      }
       if (!files[0]?.object_key) return { ok: false as const, error: "Stored file is missing. Older database copies are unchanged." };
       try {
         const url = await signedGetUrl(files[0].object_key, files[0].name, files[0].content_type || "application/octet-stream", 300);

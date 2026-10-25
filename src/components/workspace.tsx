@@ -368,7 +368,7 @@ export function Workspace() {
           });
           if (prepared.ok) {
             try {
-              const put = await fetch(prepared.uploadUrl, { method: "PUT", headers: prepared.headers, body: file.file });
+              const put = await fetch(prepared.uploadUrl, { method: "PUT", headers: prepared.headers, body: file.file, signal: AbortSignal.timeout(8000) });
               uploaded = put.ok;
               if (uploaded) attachmentFileId = prepared.fileId;
             } catch {
