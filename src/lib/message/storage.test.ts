@@ -13,6 +13,7 @@ import {
   storageConfigured,
   storageDiagnosis,
   storageSetupMessage,
+  credentialFingerprint,
 } from "./storage.ts";
 
 const KEYS = [
@@ -45,6 +46,23 @@ function restoreEnv(previous: Map<string, string | undefined>) {
 function clearEnv() {
   for (const key of KEYS) delete process.env[key];
 }
+
+test("credential fingerprint describes shape and never echoes the secret", () => {
+  const previous = saveEnv();
+  clearEnv();
+  process.env.R2_ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
+  process.env.R2_ACCESS_KEY_ID = "abcdef0123456789abcdef0123456789";
+  process.env.R2_SECRET_ACCESS_KEY = "\"not-a-real-secret-value\"";
+  process.env.R2_BUCKET = "officium-message-files";
+  const note = credentialFingerprint();
+  assert.match(note, /Account id is 32 characters, hexadecimal/);
+  assert.match(note, /Access key is 32 characters, hexadecimal/);
+  assert.match(note, /Secret is 25 characters, not hexadecimal, wrapped in quotes/);
+  assert.match(note, /expected private bucket/);
+  assert.equal(note.includes("not-a-real-secret-value"), false);
+  assert.equal(note.includes("abcdef0123456789abcdef0123456789"), false);
+  restoreEnv(previous);
+});
 
 test("rejects types and sizes without writing a file", () => {
   assert.equal(allowFile("image/png", 120_000, false).ok, true);

@@ -109,7 +109,11 @@ A team that shares modest PDFs and images should stay inside the free Standard a
 
 7. Sign in as a manager, open Apps, choose storage, and use Test connection.
 
-Test connection calls `HeadBucket`, then `PutObject`, `HeadObject`, and `DeleteObject` on `officium/ws_officium/_health/<id>.txt`. The status becomes **Operational** only if all of those succeed. If the variables are missing, the status stays **Not configured** and nothing is sent. Invalid values, such as a bucket URL or an `http://` endpoint, show **Configuration error**. A reachable setup that still fails the write or delete shows **Connection failed**. This workspace has not been given R2 credentials, so that live check has not succeeded here.
+Test connection calls `HeadBucket`, then `PutObject`, `HeadObject`, and `DeleteObject` on `officium/ws_officium/_health/<id>.txt`. The status becomes **Operational** only if all of those succeed. If the variables are missing, the status stays **Not configured** and nothing is sent. Invalid values, such as a bucket URL or an `http://` endpoint, show **Configuration error**. A reachable setup that still fails the write or delete shows **Connection failed**.
+
+A direct server upload and a signed PUT were both tested against the production bucket on 25 Oct 2026. R2 answered **HTTP 401 Unauthorized** to both. The signed URL used region `auto`, the bucket name `officium-message-files`, a 32-character hexadecimal access key, and no checksum parameter. That 401 is the credential pair being rejected. It is not caused by CORS. A missing Object Read & Write permission normally returns 403, which did not happen. The browser additionally shows a network error until the CORS rule below exists, because the browser is not allowed to read R2's response.
+
+Replace both `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` in the Vercel Production environment with a new token, then redeploy. Do not wrap the values in quotes. Leave `R2_REGION` unset.
 
 CORS lets the browser send the file bytes to R2. It does not authenticate the user and it does not decide who may see a file. Membership is checked on this server before a signed upload or download link is issued. Keep the bucket private. Do not turn on the public `r2.dev` domain.
 

@@ -199,6 +199,24 @@ export function matchesDeclaredType(declared: string, sample: Uint8Array) {
   return sniffed === declared;
 }
 
+/** Length and character class only. Never returns the credential itself. */
+export function credentialFingerprint() {
+  const classify = (value: string) => {
+    if (!value) return "missing";
+    const wrapped = value.length >= 2 && (value.startsWith("\"") || value.startsWith("'")) && value.endsWith(value[0]);
+    const hex = /^[a-f0-9]+$/i.test(value);
+    const spaces = /\s/.test(value);
+    return `${value.length} characters${hex ? ", hexadecimal" : ", not hexadecimal"}${wrapped ? ", wrapped in quotes" : ""}${spaces ? ", contains spaces" : ""}`;
+  };
+  const bucket = envName("R2_BUCKET") || envName("S3_BUCKET");
+  const bucketNote = bucket === "officium-message-files"
+    ? "the expected private bucket"
+    : bucket
+      ? "not officium-message-files"
+      : "missing";
+  return `Account id is ${classify(envName("R2_ACCOUNT_ID"))}. Access key is ${classify(envName("R2_ACCESS_KEY_ID") || envName("S3_ACCESS_KEY_ID"))}. Secret is ${classify(envName("R2_SECRET_ACCESS_KEY") || envName("S3_SECRET_ACCESS_KEY"))}. Bucket is ${bucketNote}.`;
+}
+
 export function safeFileName(name: string) {
   const cleaned = name.replace(/[\r\n"\\]/g, "").replace(/[^\w.\- ()[\]]+/g, "_").slice(0, 120);
   return cleaned || "file";

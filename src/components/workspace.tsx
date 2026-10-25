@@ -314,7 +314,7 @@ export function Workspace() {
         try {
           put = await fetch(prepared.uploadUrl, { method: "PUT", headers: prepared.headers, body: pendingFile.file });
         } catch {
-          setComposerError("The browser could not reach Cloudflare R2. Add this site to the bucket CORS rules, then try again. The file was not saved in the database.");
+          setComposerError("The browser was blocked before Cloudflare R2 could accept the file. Add a private CORS rule for https://message.officiumconnect.in that allows PUT, GET, and HEAD with the content-type header. The file was not saved.");
           return;
         }
         if (!put.ok) {

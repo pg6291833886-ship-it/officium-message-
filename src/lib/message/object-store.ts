@@ -15,6 +15,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import {
   SIGNED_URL_SECONDS,
   assertObjectKey,
+  credentialFingerprint,
   matchesDeclaredType,
   readStorageConfig,
   safeFileName,
@@ -63,6 +64,9 @@ function storageError(err: unknown, action: string) {
   }
   if (name === "AccessDenied" || name === "Forbidden" || status === 403) {
     return new Error(`R2 denied ${action}. Check R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and that the token can use this bucket.`);
+  }
+  if (name === "Unauthorized" || status === 401) {
+    return new Error(`R2 rejected the credentials during ${action}. Create a new Object Read & Write token for this bucket and replace both the access key and the secret. ${credentialFingerprint()}`);
   }
   if (name === "TimeoutError" || name === "AbortError") return new Error(`R2 timed out during ${action}.`);
   const raw = err instanceof Error ? err.message : "Unknown storage error";
